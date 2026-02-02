@@ -14,31 +14,25 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 // ---------- CORS ----------
 const corsOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
-app.use(cors({
-  origin: function (origin, cb) {
-    // origin nélküli requestek (pl. curl, stripe webhook) -> engedjük
-    if (!origin) return cb(null, true);
+app.use(
+  cors({
+    origin: function (origin, cb) {
+      // origin nélküli requestek (pl. curl, stripe webhook) -> engedjük
+      if (!origin) return cb(null, true);
 
-    if (!corsOrigins.length) return cb(null, true);
+      if (!corsOrigins.length) return cb(null, true);
 
-    if (corsOrigins.includes(origin)) return cb(null, true);
+      if (corsOrigins.includes(origin)) return cb(null, true);
 
-    return cb(new Error("Not allowed by CORS: " + origin));
-  },
-  methods: ["POST", "GET"],
-  credentials: true,
-}));
-
-// ---------- JSON body (NEM webhookhoz!) ----------
-// Fontos: a webhook route előtt ne legyen global json body.
-// Itt úgy oldjuk meg, hogy minden request json, kivéve webhook.
-app.use((req, res, next) => {
-  if (req.originalUrl === "/api/stripe/webhook") return next();
-  return express.json()(req, res, next);
-});
+      return cb(new Error("Not allowed by CORS: " + origin));
+    },
+    methods: ["POST", "GET"],
+    credentials: true,
+  })
+);
 
 // ---------- “DB” (JSON fájl) ----------
 const DATA_DIR = path.join(__dirname, "data");
@@ -93,105 +87,11 @@ function getSetupFeePriceId(plan) {
 // commitment vége unix timestamp (másodperc)
 function calcCommitmentEndsAt(termMonths) {
   const nowSec = Math.floor(Date.now() / 1000);
-  return nowSec + (termMonths * 30 * 24 * 60 * 60);
+  return nowSec + termMonths * 30 * 24 * 60 * 60;
 }
 
-// ---------- Health ----------
-app.get("/", (req, res) => {
-  res.json({ ok: true, service: "quantum-stripe-backend" });
-});
-
-// ---------- Create Checkout Session ----------
-app.post("/api/create-checkout-session", async (req, res) => {
-  try {
-    const { email, plan, termMonths, devicesTotal, contractId } = req.body;
-
-    if (!email || typeof email !== "string") {
-      return res.status(400).json({ error: "Missing/invalid email" });
-    }
-    if (!isValidPlan(plan)) {
-      return res.status(400).json({ error: "Invalid plan (basic/premium)" });
-    }
-
-    const term = Number(termMonths);
-    if (!isValidTerm(term)) {
-      return res.status(400).json({ error: "Invalid termMonths (12 or 36)" });
-    }
-
-    // eszközök: minimum 1, maximum 1000
-    const totalDevices = clampInt(devicesTotal, 1, 1000);
-
-    // 25 benne van, afölött extra
-    const included = 25;
-    const extraDevices = Math.max(0, totalDevices - included);
-
-    const monthlyPrice = getMonthlyPriceId(plan);
-    const devicePrice = getDevicePriceId(plan);
-
-    if (!monthlyPrice || !devicePrice) {
-      return res.status(500).json({ error: "Missing PRICE env vars for plan" });
-    }
-
-    const commitmentEndsAt = calcCommitmentEndsAt(term);
-
-    const lineItems = [
-      { price: monthlyPrice, quantity: 1 },
-    ];
-
-    if (extraDevices > 0) {
-      lineItems.push({ price: devicePrice, quantity: extraDevices });
-    }
-
-    // Setup fee csak 12 hónapnál (one-time price!)
-    if (term === 12) {
-      const setupFee = getSetupFeePriceId(plan);
-      if (!setupFee) {
-        return res.status(500).json({ error: "Missing setup fee price env var" });
-      }
-      lineItems.push({ price: setupFee, quantity: 1 });
-    }
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer_email: email,
-      line_items: lineItems,
-
-      success_url: `${process.env.WP_SUCCESS_URL}?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: process.env.WP_CANCEL_URL,
-
-      subscription_data: {
-        metadata: {
-          contractId: contractId ? String(contractId) : "",
-          plan: String(plan),
-          termMonths: String(term),
-          devicesTotal: String(totalDevices),
-          extraDevices: String(extraDevices),
-          commitmentEndsAt: String(commitmentEndsAt),
-        }
-      },
-
-      metadata: {
-        contractId: contractId ? String(contractId) : "",
-        plan: String(plan),
-        termMonths: String(term),
-        devicesTotal: String(totalDevices),
-        extraDevices: String(extraDevices),
-        commitmentEndsAt: String(commitmentEndsAt),
-      }
-    });
-
-    return res.json({ url: session.url });
-  } catch (err) {
-    console.error("create-checkout-session error:", err);
-    return res.status(500).json({
-      error: "Server error creating checkout session",
-      details: err?.message || String(err)
-    });
-  }
-});
-
-// ---------- Stripe Webhook (RAW BODY!) ----------
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+// ---------- Stripe Webhook handler (közös) ----------
+async function handleStripeWebhook(req, res) {
   const sig = req.headers["stripe-signature"];
   let event;
 
@@ -220,7 +120,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       if (merged.contractId) {
         db.byContractId[merged.contractId] = {
           ...(db.byContractId[merged.contractId] || {}),
-          ...merged
+          ...merged,
         };
       }
 
@@ -237,7 +137,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         console.log("✅ checkout.session.completed", {
           email: session.customer_email,
           subscription: subscriptionId,
-          metadata: session.metadata
+          metadata: session.metadata,
         });
 
         await upsertBySubscription(subscriptionId, {
@@ -261,14 +161,12 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         const invoice = event.data.object;
 
         const subscriptionId =
-          invoice.subscription ||
-          invoice.lines?.data?.[0]?.subscription ||
-          null;
+          invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
 
         console.log("✅ invoice.payment_succeeded", {
           customer: invoice.customer,
           subscription: subscriptionId,
-          amount_paid: invoice.amount_paid
+          amount_paid: invoice.amount_paid,
         });
 
         await upsertBySubscription(subscriptionId, {
@@ -286,13 +184,11 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         const invoice = event.data.object;
 
         const subscriptionId =
-          invoice.subscription ||
-          invoice.lines?.data?.[0]?.subscription ||
-          null;
+          invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
 
         console.log("❌ invoice.payment_failed", {
           customer: invoice.customer,
-          subscription: subscriptionId
+          subscription: subscriptionId,
         });
 
         await upsertBySubscription(subscriptionId, {
@@ -319,13 +215,113 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       }
 
       default:
+        // nem baj, ha mást nem kezelsz, csak 200-at adj vissza
         break;
     }
 
-    return res.json({ received: true });
+    return res.status(200).json({ received: true });
   } catch (err) {
     console.error("Webhook handler error:", err);
     return res.status(500).send("Webhook handler error");
+  }
+}
+
+// ---------- WEBHOOK ROUTES RAW BODY-val (FONTOS: még a JSON parser előtt!) ----------
+// Ez az, amit a Stripe-ban beállítottál:
+app.post("/api/webhook", express.raw({ type: "application/json" }), handleStripeWebhook);
+
+// Meghagyjuk kompatibilitás miatt a régi utat is:
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), handleStripeWebhook);
+
+// ---------- JSON body a többi route-hoz ----------
+app.use(express.json());
+
+// ---------- Health ----------
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "quantum-stripe-backend" });
+});
+
+// ---------- Create Checkout Session ----------
+app.post("/api/create-checkout-session", async (req, res) => {
+  try {
+    const { email, plan, termMonths, devicesTotal, contractId } = req.body;
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "Missing/invalid email" });
+    }
+    if (!isValidPlan(plan)) {
+      return res.status(400).json({ error: "Invalid plan (basic/premium)" });
+    }
+
+    const term = Number(termMonths);
+    if (!isValidTerm(term)) {
+      return res.status(400).json({ error: "Invalid termMonths (12 or 36)" });
+    }
+
+    const totalDevices = clampInt(devicesTotal, 1, 1000);
+
+    const included = 25;
+    const extraDevices = Math.max(0, totalDevices - included);
+
+    const monthlyPrice = getMonthlyPriceId(plan);
+    const devicePrice = getDevicePriceId(plan);
+
+    if (!monthlyPrice || !devicePrice) {
+      return res.status(500).json({ error: "Missing PRICE env vars for plan" });
+    }
+
+    const commitmentEndsAt = calcCommitmentEndsAt(term);
+
+    const lineItems = [{ price: monthlyPrice, quantity: 1 }];
+
+    if (extraDevices > 0) {
+      lineItems.push({ price: devicePrice, quantity: extraDevices });
+    }
+
+    if (term === 12) {
+      const setupFee = getSetupFeePriceId(plan);
+      if (!setupFee) {
+        return res.status(500).json({ error: "Missing setup fee price env var" });
+      }
+      lineItems.push({ price: setupFee, quantity: 1 });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: email,
+      line_items: lineItems,
+
+      success_url: `${process.env.WP_SUCCESS_URL}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: process.env.WP_CANCEL_URL,
+
+      subscription_data: {
+        metadata: {
+          contractId: contractId ? String(contractId) : "",
+          plan: String(plan),
+          termMonths: String(term),
+          devicesTotal: String(totalDevices),
+          extraDevices: String(extraDevices),
+          commitmentEndsAt: String(commitmentEndsAt),
+        },
+      },
+
+      metadata: {
+        contractId: contractId ? String(contractId) : "",
+        plan: String(plan),
+        termMonths: String(term),
+        devicesTotal: String(totalDevices),
+        extraDevices: String(extraDevices),
+        commitmentEndsAt: String(commitmentEndsAt),
+      },
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error("create-checkout-session error:", err);
+    return res.status(500).json({
+      error: "Server error creating checkout session",
+      details: err?.message || String(err),
+    });
   }
 });
 
@@ -336,28 +332,31 @@ app.get("/api/session-status", async (req, res) => {
     if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
 
     const session = await stripe.checkout.sessions.retrieve(sessionId, {
-      expand: ["subscription", "line_items.data.price.product"]
+      expand: ["subscription", "line_items.data.price.product"],
     });
 
     const paid = session.payment_status === "paid" || session.status === "complete";
 
     const metadata = session.metadata || {};
-    const sub = session.subscription && typeof session.subscription === "object"
-      ? session.subscription
-      : null;
+    const sub =
+      session.subscription && typeof session.subscription === "object"
+        ? session.subscription
+        : null;
 
     const commitmentEndsAt = Number(metadata.commitmentEndsAt || 0);
 
     const planLabel =
-      metadata.plan === "basic" ? "Alapcsomag" :
-      metadata.plan === "premium" ? "Prémiumcsomag" :
-      (metadata.plan || "");
+      metadata.plan === "basic"
+        ? "Alapcsomag"
+        : metadata.plan === "premium"
+        ? "Prémiumcsomag"
+        : metadata.plan || "";
 
-    const items = (session.line_items?.data || []).map(li => ({
+    const items = (session.line_items?.data || []).map((li) => ({
       description: li.description || li.price?.nickname || li.price?.id || "",
       quantity: li.quantity || 0,
       amount_total: li.amount_total || 0,
-      currency: li.currency || ""
+      currency: li.currency || "",
     }));
 
     return res.json({
@@ -373,16 +372,17 @@ app.get("/api/session-status", async (req, res) => {
       devicesTotal: metadata.devicesTotal ? Number(metadata.devicesTotal) : null,
       extraDevices: metadata.extraDevices ? Number(metadata.extraDevices) : null,
       commitmentEndsAt: commitmentEndsAt || null,
-      items
+      items,
     });
   } catch (err) {
     console.error("session-status error:", err);
     return res.status(500).json({
       error: "Server error",
-      details: err?.message || String(err)
+      details: err?.message || String(err),
     });
   }
 });
+
 app.get("/api/subscription-status", async (req, res) => {
   try {
     const subscriptionId = String(req.query.subscriptionId || "").trim();
@@ -404,13 +404,12 @@ app.get("/api/subscription-status", async (req, res) => {
       commitmentEndsAt: row.commitmentEndsAt || null,
       cancelAtPeriodEnd: !!row.cancelAtPeriodEnd,
       status: row.status || "",
-      updatedAt: row.updatedAt || null
+      updatedAt: row.updatedAt || null,
     });
   } catch (err) {
     return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
   }
 });
-
 
 // ---------- Cancel request (commitment után) ----------
 app.post("/api/request-cancel", async (req, res) => {
@@ -433,13 +432,12 @@ app.post("/api/request-cancel", async (req, res) => {
     if (commitmentEndsAt && nowSec < commitmentEndsAt) {
       return res.status(400).json({
         error: "Commitment active - cannot cancel yet",
-        commitmentEndsAt
+        commitmentEndsAt,
       });
     }
 
-    // Lemondás a következő periódus végére
     const updated = await stripe.subscriptions.update(subscriptionId, {
-      cancel_at_period_end: true
+      cancel_at_period_end: true,
     });
 
     row.cancelAtPeriodEnd = true;
@@ -454,13 +452,13 @@ app.post("/api/request-cancel", async (req, res) => {
     return res.json({
       ok: true,
       subscriptionId,
-      cancel_at_period_end: updated.cancel_at_period_end
+      cancel_at_period_end: updated.cancel_at_period_end,
     });
   } catch (err) {
     console.error("request-cancel error:", err);
     return res.status(500).json({
       error: "Server error",
-      details: err?.message || String(err)
+      details: err?.message || String(err),
     });
   }
 });
