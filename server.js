@@ -17,13 +17,10 @@ const corsOrigins = (process.env.CORS_ORIGINS || "")
 app.use(
   cors({
     origin: function (origin, cb) {
-      // origin nélküli requestek (pl. curl, stripe webhook) -> engedjük
+      // origin nélküli requestek (Stripe webhook, curl) -> engedjük
       if (!origin) return cb(null, true);
-
-      if (!corsOrigins.length) return cb(null, true;
-
+      if (!corsOrigins.length) return cb(null, true);
       if (corsOrigins.includes(origin)) return cb(null, true);
-
       return cb(new Error("Not allowed by CORS: " + origin));
     },
     methods: ["POST", "GET"],
@@ -66,19 +63,19 @@ function getSetupFeePriceId(plan) {
   return null;
 }
 
+// commitment vége unix timestamp (másodperc) - egyszerű 30 napos hónap közelítés
+function calcCommitmentEndsAt(termMonths) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  return nowSec + termMonths * 30 * 24 * 60 * 60;
+}
+
 function planLabel(plan) {
   if (plan === "basic") return "Alapcsomag";
   if (plan === "premium") return "Prémiumcsomag";
   return plan || "";
 }
 
-// commitment vége unix timestamp (másodperc) - egyszerű 30 nap/hó közelítés
-function calcCommitmentEndsAt(termMonths) {
-  const nowSec = Math.floor(Date.now() / 1000);
-  return nowSec + termMonths * 30 * 24 * 60 * 60;
-}
-
-// ---------- Email (SMTP) ----------
+// ---------- Email (SMTP) - opcionális ----------
 function getMailer() {
   const host = process.env.SMTP_HOST;
   const port = Number(process.env.SMTP_PORT || "587");
@@ -98,10 +95,7 @@ function getMailer() {
 async function sendMailSafe({ to, subject, text }) {
   try {
     const transporter = getMailer();
-    if (!transporter) {
-      console.log("MAIL: SMTP not configured, skipping email send.");
-      return;
-    }
+    if (!transporter) return; // nincs SMTP beállítva
 
     await transporter.sendMail({
       from: process.env.MAIL_FROM || "no-reply@example.com",
@@ -109,10 +103,8 @@ async function sendMailSafe({ to, subject, text }) {
       subject,
       text,
     });
-
-    console.log("MAIL: sent to", to);
   } catch (e) {
-    console.error("MAIL: send failed:", e?.message || e);
+    console.error("MAIL send failed:", e?.message || e);
   }
 }
 
@@ -125,51 +117,88 @@ function requireAdmin(req, res, next) {
   if (!process.env.ADMIN_TOKEN) {
     return res.status(500).json({ error: "ADMIN_TOKEN not set on server" });
   }
-
   if (token !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-
   return next();
-}
-
-// ---------- Stripe helpers ----------
-async function getSubscriptionWithCustomer(subscriptionId) {
-  return stripe.subscriptions.retrieve(subscriptionId, {
-    expand: ["customer", "latest_invoice", "latest_invoice.payment_intent"],
-  });
-}
-
-function normalizeSubscription(sub) {
-  const md = sub.metadata || {};
-  const customer = sub.customer && typeof sub.customer === "object" ? sub.customer : null;
-
-  const commitmentEndsAt = Number(md.commitmentEndsAt || 0) || 0;
-
-  return {
-    subscriptionId: sub.id,
-    status: sub.status,
-    cancelAtPeriodEnd: !!sub.cancel_at_period_end,
-    currentPeriodEnd: sub.current_period_end ? Number(sub.current_period_end) : null,
-    currentPeriodStart: sub.current_period_start ? Number(sub.current_period_start) : null,
-
-    customerId: customer?.id || (typeof sub.customer === "string" ? sub.customer : null),
-    email: customer?.email || md.email || "",
-
-    plan: md.plan || "",
-    planLabel: planLabel(md.plan || ""),
-    termMonths: md.termMonths ? Number(md.termMonths) : null,
-    devicesTotal: md.devicesTotal ? Number(md.devicesTotal) : null,
-    extraDevices: md.extraDevices ? Number(md.extraDevices) : null,
-    commitmentEndsAt: commitmentEndsAt || null,
-
-    created: sub.created ? Number(sub.created) : null,
-  };
 }
 
 // ---------- Health ----------
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "quantum-stripe-backend", storage: "stripe-only" });
+  res.json({ ok: true, service: "quantum-stripe-backend (stripe-only)" });
+});
+
+// ---------- Admin: Stripe subscription list ----------
+app.get("/api/admin/subscriptions", requireAdmin, async (req, res) => {
+  try {
+    const limit = clampInt(req.query.limit, 1, 100);
+    const status = String(req.query.status || "all"); // all | active | canceled | etc.
+
+    const params = { limit };
+    if (status !== "all") params.status = status;
+
+    // expand: customer, hogy email is legyen
+    const list = await stripe.subscriptions.list({
+      ...params,
+      expand: ["data.customer"],
+    });
+
+    const items = (list.data || []).map((s) => {
+      const customer = s.customer && typeof s.customer === "object" ? s.customer : null;
+      return {
+        id: s.id,
+        status: s.status,
+        cancel_at_period_end: !!s.cancel_at_period_end,
+        current_period_end: s.current_period_end,
+        created: s.created,
+        customerId: customer?.id || (typeof s.customer === "string" ? s.customer : null),
+        email: customer?.email || null,
+        metadata: s.metadata || {},
+      };
+    });
+
+    return res.json({ ok: true, count: items.length, items });
+  } catch (e) {
+    console.error("admin/subscriptions error:", e);
+    return res.status(500).json({ error: "Server error", details: e?.message || String(e) });
+  }
+});
+
+// ---------- Admin: Stripe subscription detail ----------
+app.get("/api/admin/subscription/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = String(req.params.id || "").trim();
+    if (!id) return res.status(400).json({ error: "Missing id" });
+
+    const sub = await stripe.subscriptions.retrieve(id, {
+      expand: ["customer", "items.data.price.product"],
+    });
+
+    const customer = sub.customer && typeof sub.customer === "object" ? sub.customer : null;
+
+    return res.json({
+      ok: true,
+      subscription: {
+        id: sub.id,
+        status: sub.status,
+        cancel_at_period_end: !!sub.cancel_at_period_end,
+        current_period_end: sub.current_period_end,
+        created: sub.created,
+        customerId: customer?.id || (typeof sub.customer === "string" ? sub.customer : null),
+        email: customer?.email || null,
+        metadata: sub.metadata || {},
+        items: (sub.items?.data || []).map((it) => ({
+          priceId: it.price?.id,
+          nickname: it.price?.nickname || null,
+          product: it.price?.product || null,
+          quantity: it.quantity || 0,
+        })),
+      },
+    });
+  } catch (e) {
+    console.error("admin/subscription/:id error:", e);
+    return res.status(500).json({ error: "Server error", details: e?.message || String(e) });
+  }
 });
 
 // ---------- Create Checkout Session ----------
@@ -190,13 +219,11 @@ app.post("/api/create-checkout-session", async (req, res) => {
     }
 
     const totalDevices = clampInt(devicesTotal, 1, 1000);
-
     const included = 25;
     const extraDevices = Math.max(0, totalDevices - included);
 
     const monthlyPrice = getMonthlyPriceId(plan);
     const devicePrice = getDevicePriceId(plan);
-
     if (!monthlyPrice || !devicePrice) {
       return res.status(500).json({ error: "Missing PRICE env vars for plan" });
     }
@@ -204,9 +231,10 @@ app.post("/api/create-checkout-session", async (req, res) => {
     const commitmentEndsAt = calcCommitmentEndsAt(term);
 
     const lineItems = [{ price: monthlyPrice, quantity: 1 }];
-    if (extraDevices > 0) lineItems.push({ price: devicePrice, quantity: extraDevices });
+    if (extraDevices > 0) {
+      lineItems.push({ price: devicePrice, quantity: extraDevices });
+    }
 
-    // Setup fee csak 12 hónapnál
     if (term === 12) {
       const setupFee = getSetupFeePriceId(plan);
       if (!setupFee) {
@@ -215,6 +243,15 @@ app.post("/api/create-checkout-session", async (req, res) => {
       lineItems.push({ price: setupFee, quantity: 1 });
     }
 
+    const meta = {
+      contractId: contractId ? String(contractId) : "",
+      plan: String(plan),
+      termMonths: String(term),
+      devicesTotal: String(totalDevices),
+      extraDevices: String(extraDevices),
+      commitmentEndsAt: String(commitmentEndsAt),
+    };
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer_email: email,
@@ -222,28 +259,9 @@ app.post("/api/create-checkout-session", async (req, res) => {
       success_url: `${process.env.WP_SUCCESS_URL}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: process.env.WP_CANCEL_URL,
 
-      // MINDENT metadata-ba, mert Stripe-ONLY lesz
-      subscription_data: {
-        metadata: {
-          contractId: contractId ? String(contractId) : "",
-          email: String(email),
-          plan: String(plan),
-          termMonths: String(term),
-          devicesTotal: String(totalDevices),
-          extraDevices: String(extraDevices),
-          commitmentEndsAt: String(commitmentEndsAt),
-        },
-      },
-
-      metadata: {
-        contractId: contractId ? String(contractId) : "",
-        email: String(email),
-        plan: String(plan),
-        termMonths: String(term),
-        devicesTotal: String(totalDevices),
-        extraDevices: String(extraDevices),
-        commitmentEndsAt: String(commitmentEndsAt),
-      },
+      // FONTOS: a subscription metadata ide kerül -> később Stripe-only lemondásnál ebből dolgozunk
+      subscription_data: { metadata: meta },
+      metadata: meta,
     });
 
     return res.json({ url: session.url });
@@ -257,155 +275,57 @@ app.post("/api/create-checkout-session", async (req, res) => {
 });
 
 // ---------- Stripe Webhook (RAW BODY!) ----------
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
 
-    try {
-      event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-      console.error("Webhook signature verify failed:", err.message);
-      return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("Webhook signature verify failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
 
-    try {
-      switch (event.type) {
-        case "checkout.session.completed": {
-          const session = event.data.object;
-          const subscriptionId = session.subscription;
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        const subscriptionId = session.subscription;
 
-          console.log("checkout.session.completed", {
-            email: session.customer_email,
-            subscription: subscriptionId,
+        console.log("✅ checkout.session.completed", {
+          email: session.customer_email,
+          subscription: subscriptionId,
+          metadata: session.metadata,
+        });
+
+        // opcionális email
+        if (session.customer_email) {
+          await sendMailSafe({
+            to: session.customer_email,
+            subject: "Quantum ITech - Sikeres előfizetés",
+            text:
+              "Sikeres fizetés és előfizetés létrejött.\n\n" +
+              "Csomag: " + planLabel(session.metadata?.plan || "") + "\n" +
+              "Szerződés hossza (hó): " + (session.metadata?.termMonths || "") + "\n" +
+              "Eszközök száma: " + (session.metadata?.devicesTotal || "") + "\n" +
+              "Előfizetés azonosító: " + subscriptionId + "\n\n" +
+              "Köszönjük,\nQuantum ITech",
           });
-
-          // Email: visszaigazolás (ha van SMTP)
-          const to = session.customer_email || "";
-          if (to && subscriptionId) {
-            // Itt már kérhetjük a subscription-t metadata miatt (Stripe-ONLY)
-            let sub = null;
-            try {
-              sub = await getSubscriptionWithCustomer(subscriptionId);
-            } catch (e) {
-              console.log("Webhook: cannot retrieve sub for email, continuing:", e?.message || e);
-            }
-
-            const md = sub?.metadata || session.metadata || {};
-
-            await sendMailSafe({
-              to,
-              subject: "Quantum ITech - Sikeres előfizetés",
-              text:
-                "Sikeres fizetés és előfizetés létrejött.\n\n" +
-                "Csomag: " + planLabel(md.plan || "") + "\n" +
-                "Szerződés hossza (hó): " + (md.termMonths || "") + "\n" +
-                "Eszközök száma: " + (md.devicesTotal || "") + "\n" +
-                "Előfizetés azonosító: " + subscriptionId + "\n\n" +
-                "Köszönjük,\nQuantum ITech",
-            });
-          }
-
-          break;
         }
-
-        case "invoice.payment_succeeded": {
-          const invoice = event.data.object;
-          console.log("invoice.payment_succeeded", { invoiceId: invoice.id, sub: invoice.subscription });
-          break;
-        }
-
-        case "invoice.payment_failed": {
-          const invoice = event.data.object;
-          console.log("invoice.payment_failed", { invoiceId: invoice.id, sub: invoice.subscription });
-          break;
-        }
-
-        case "customer.subscription.deleted": {
-          const sub = event.data.object;
-          console.log("customer.subscription.deleted", { id: sub.id, status: sub.status });
-          break;
-        }
-
-        default:
-          break;
+        break;
       }
 
-      // fontos: mindig 200-at adjunk, különben Stripe újraküld
-      return res.json({ received: true });
-    } catch (err) {
-      console.error("Webhook handler error:", err);
-      // még itt is jobb 200-at adni, hogy ne floodoljon
-      return res.json({ received: true, warning: "handler_error_logged" });
+      case "invoice.payment_succeeded":
+      case "invoice.payment_failed":
+      case "customer.subscription.deleted":
+      default:
+        break;
     }
-  }
-);
 
-// ---------- Admin: Stripe-ONLY lista ----------
-app.get("/api/admin/subscriptions", requireAdmin, async (req, res) => {
-  try {
-    const limit = clampInt(req.query.limit, 1, 100);
-    const startingAfter = req.query.starting_after ? String(req.query.starting_after) : undefined;
-
-    const resp = await stripe.subscriptions.list({
-      limit,
-      ...(startingAfter ? { starting_after: startingAfter } : {}),
-      // Stripe list nem expand-eli tömegesen jól a customer-t, ezért az emailt metadata-ból is adjuk
-    });
-
-    const items = resp.data.map((sub) => ({
-      subscriptionId: sub.id,
-      status: sub.status,
-      cancelAtPeriodEnd: !!sub.cancel_at_period_end,
-      currentPeriodEnd: sub.current_period_end ? Number(sub.current_period_end) : null,
-      customerId: typeof sub.customer === "string" ? sub.customer : (sub.customer?.id || null),
-      email: sub.metadata?.email || "",
-      plan: sub.metadata?.plan || "",
-      planLabel: planLabel(sub.metadata?.plan || ""),
-      termMonths: sub.metadata?.termMonths ? Number(sub.metadata.termMonths) : null,
-      devicesTotal: sub.metadata?.devicesTotal ? Number(sub.metadata.devicesTotal) : null,
-      extraDevices: sub.metadata?.extraDevices ? Number(sub.metadata.extraDevices) : null,
-      commitmentEndsAt: sub.metadata?.commitmentEndsAt ? Number(sub.metadata.commitmentEndsAt) : null,
-      created: sub.created ? Number(sub.created) : null,
-    }));
-
-    return res.json({
-      ok: true,
-      count: items.length,
-      has_more: !!resp.has_more,
-      items,
-    });
+    return res.json({ received: true });
   } catch (err) {
-    console.error("admin/subscriptions error:", err);
-    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
-  }
-});
-
-// ---------- Admin: egy subscription részletesen ----------
-app.get("/api/admin/subscriptions/:subscriptionId", requireAdmin, async (req, res) => {
-  try {
-    const subscriptionId = String(req.params.subscriptionId || "").trim();
-    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
-
-    const sub = await getSubscriptionWithCustomer(subscriptionId);
-    return res.json({ ok: true, item: normalizeSubscription(sub) });
-  } catch (err) {
-    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
-  }
-});
-
-// ---------- Public: subscription status (Stripe-ONLY) ----------
-app.get("/api/subscription-status", async (req, res) => {
-  try {
-    const subscriptionId = String(req.query.subscriptionId || "").trim();
-    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
-
-    const sub = await getSubscriptionWithCustomer(subscriptionId);
-    return res.json({ ok: true, ...normalizeSubscription(sub) });
-  } catch (err) {
-    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
+    console.error("Webhook handler error:", err);
+    return res.status(500).send("Webhook handler error");
   }
 });
 
@@ -420,19 +340,9 @@ app.get("/api/session-status", async (req, res) => {
     });
 
     const paid = session.payment_status === "paid" || session.status === "complete";
-
     const metadata = session.metadata || {};
     const sub =
-      session.subscription && typeof session.subscription === "object"
-        ? session.subscription
-        : null;
-
-    const items = (session.line_items?.data || []).map((li) => ({
-      description: li.description || li.price?.nickname || li.price?.id || "",
-      quantity: li.quantity || 0,
-      amount_total: li.amount_total || 0,
-      currency: li.currency || "",
-    }));
+      session.subscription && typeof session.subscription === "object" ? session.subscription : null;
 
     return res.json({
       ok: true,
@@ -447,42 +357,61 @@ app.get("/api/session-status", async (req, res) => {
       devicesTotal: metadata.devicesTotal ? Number(metadata.devicesTotal) : null,
       extraDevices: metadata.extraDevices ? Number(metadata.extraDevices) : null,
       commitmentEndsAt: metadata.commitmentEndsAt ? Number(metadata.commitmentEndsAt) : null,
-      items,
+      items: (session.line_items?.data || []).map((li) => ({
+        description: li.description || li.price?.nickname || li.price?.id || "",
+        quantity: li.quantity || 0,
+        amount_total: li.amount_total || 0,
+        currency: li.currency || "",
+      })),
     });
   } catch (err) {
     console.error("session-status error:", err);
-    return res.status(500).json({
-      error: "Server error",
-      details: err?.message || String(err),
-    });
+    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
   }
 });
 
-// ---------- Cancel request (Stripe-ONLY + fallback) ----------
+// ---------- Subscription status (Stripe-only) ----------
+app.get("/api/subscription-status", async (req, res) => {
+  try {
+    const subscriptionId = String(req.query.subscriptionId || "").trim();
+    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
+
+    const sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: ["customer"] });
+    const customer = sub.customer && typeof sub.customer === "object" ? sub.customer : null;
+
+    return res.json({
+      ok: true,
+      subscriptionId: sub.id,
+      email: customer?.email || null,
+      status: sub.status,
+      cancelAtPeriodEnd: !!sub.cancel_at_period_end,
+      currentPeriodEnd: sub.current_period_end,
+      metadata: sub.metadata || {},
+    });
+  } catch (err) {
+    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
+  }
+});
+
+// ---------- Cancel request (Stripe-only + commitment metadata alapján) ----------
 app.post("/api/request-cancel", async (req, res) => {
   try {
     const { subscriptionId, email } = req.body || {};
-    const subId = String(subscriptionId || "").trim();
-    if (!subId) return res.status(400).json({ error: "Missing subscriptionId" });
+    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
 
-    const sub = await getSubscriptionWithCustomer(subId);
+    const sub = await stripe.subscriptions.retrieve(subscriptionId, { expand: ["customer"] });
     const customer = sub.customer && typeof sub.customer === "object" ? sub.customer : null;
 
-    // email ellenőrzés: ha megadta a user, próbáljuk validálni customer.email alapján
-    // fallback: ha a customer.email üres, akkor nem tiltunk (Stripe-ONLY világban ez előfordulhat)
-    if (email) {
-      const given = String(email).toLowerCase().trim();
-      const real = String(customer?.email || sub.metadata?.email || "").toLowerCase().trim();
-
-      if (real && given !== real) {
+    // email ellenőrzés (ha küldesz emailt)
+    if (email && customer?.email) {
+      if (String(email).toLowerCase() !== String(customer.email).toLowerCase()) {
         return res.status(403).json({ error: "Email mismatch" });
       }
     }
 
-    // Commitment ellenőrzés: Stripe fallback
-    // Ha nincs commitmentEndsAt metadata-ban -> ENGEDJÜK a lemondást (ez a fallback lényege)
+    // commitment ellenőrzés a subscription metadata alapján
     const nowSec = Math.floor(Date.now() / 1000);
-    const commitmentEndsAt = Number(sub.metadata?.commitmentEndsAt || 0) || 0;
+    const commitmentEndsAt = Number(sub.metadata?.commitmentEndsAt || 0);
 
     if (commitmentEndsAt && nowSec < commitmentEndsAt) {
       return res.status(400).json({
@@ -491,19 +420,18 @@ app.post("/api/request-cancel", async (req, res) => {
       });
     }
 
-    const updated = await stripe.subscriptions.update(subId, {
+    const updated = await stripe.subscriptions.update(subscriptionId, {
       cancel_at_period_end: true,
     });
 
-    // Email: lemondás visszaigazolás
-    const to = customer?.email || sub.metadata?.email || "";
-    if (to) {
+    // opcionális email a lemondásról
+    if (customer?.email) {
       await sendMailSafe({
-        to,
+        to: customer.email,
         subject: "Quantum ITech - Lemondás rögzítve",
         text:
           "A lemondási kérésedet rögzítettük.\n\n" +
-          "Előfizetés azonosító: " + subId + "\n" +
+          "Előfizetés azonosító: " + subscriptionId + "\n" +
           "Lemondás a periódus végén: " + String(updated.cancel_at_period_end) + "\n\n" +
           "Köszönjük,\nQuantum ITech",
       });
@@ -511,15 +439,12 @@ app.post("/api/request-cancel", async (req, res) => {
 
     return res.json({
       ok: true,
-      subscriptionId: subId,
+      subscriptionId,
       cancel_at_period_end: updated.cancel_at_period_end,
     });
   } catch (err) {
     console.error("request-cancel error:", err);
-    return res.status(500).json({
-      error: "Server error",
-      details: err?.message || String(err),
-    });
+    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
   }
 });
 
