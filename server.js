@@ -1,0 +1,470 @@
+require("dotenv").config();
+
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs-extra");
+const path = require("path");
+const Stripe = require("stripe");
+
+const app = express();
+
+// 1) Stripe init
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// ---------- CORS ----------
+const corsOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: function (origin, cb) {
+    // origin nélküli requestek (pl. curl, stripe webhook) -> engedjük
+    if (!origin) return cb(null, true);
+
+    if (!corsOrigins.length) return cb(null, true);
+
+    if (corsOrigins.includes(origin)) return cb(null, true);
+
+    return cb(new Error("Not allowed by CORS: " + origin));
+  },
+  methods: ["POST", "GET"],
+  credentials: true,
+}));
+
+// ---------- JSON body (NEM webhookhoz!) ----------
+// Fontos: a webhook route előtt ne legyen global json body.
+// Itt úgy oldjuk meg, hogy minden request json, kivéve webhook.
+app.use((req, res, next) => {
+  if (req.originalUrl === "/api/stripe/webhook") return next();
+  return express.json()(req, res, next);
+});
+
+// ---------- “DB” (JSON fájl) ----------
+const DATA_DIR = path.join(__dirname, "data");
+const CONTRACTS_FILE = path.join(DATA_DIR, "contracts.json");
+
+async function loadContracts() {
+  await fs.ensureDir(DATA_DIR);
+
+  if (!(await fs.pathExists(CONTRACTS_FILE))) {
+    await fs.writeJson(
+      CONTRACTS_FILE,
+      { byContractId: {}, bySubscriptionId: {} },
+      { spaces: 2 }
+    );
+  }
+  return fs.readJson(CONTRACTS_FILE);
+}
+
+async function saveContracts(db) {
+  await fs.writeJson(CONTRACTS_FILE, db, { spaces: 2 });
+}
+
+// ---------- Helpers ----------
+function isValidPlan(plan) {
+  return plan === "basic" || plan === "premium";
+}
+function isValidTerm(term) {
+  return term === 12 || term === 36;
+}
+function clampInt(n, min, max) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return min;
+  return Math.max(min, Math.min(max, Math.floor(x)));
+}
+
+function getMonthlyPriceId(plan) {
+  if (plan === "basic") return process.env.PRICE_BASIC_MONTHLY;
+  if (plan === "premium") return process.env.PRICE_PREMIUM_MONTHLY;
+  return null;
+}
+function getDevicePriceId(plan) {
+  if (plan === "basic") return process.env.PRICE_BASIC_DEVICE;
+  if (plan === "premium") return process.env.PRICE_PREMIUM_DEVICE;
+  return null;
+}
+function getSetupFeePriceId(plan) {
+  if (plan === "basic") return process.env.PRICE_SETUP_BASIC_1Y;
+  if (plan === "premium") return process.env.PRICE_SETUP_PREMIUM_1Y;
+  return null;
+}
+
+// commitment vége unix timestamp (másodperc)
+function calcCommitmentEndsAt(termMonths) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  return nowSec + (termMonths * 30 * 24 * 60 * 60);
+}
+
+// ---------- Health ----------
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "quantum-stripe-backend" });
+});
+
+// ---------- Create Checkout Session ----------
+app.post("/api/create-checkout-session", async (req, res) => {
+  try {
+    const { email, plan, termMonths, devicesTotal, contractId } = req.body;
+
+    if (!email || typeof email !== "string") {
+      return res.status(400).json({ error: "Missing/invalid email" });
+    }
+    if (!isValidPlan(plan)) {
+      return res.status(400).json({ error: "Invalid plan (basic/premium)" });
+    }
+
+    const term = Number(termMonths);
+    if (!isValidTerm(term)) {
+      return res.status(400).json({ error: "Invalid termMonths (12 or 36)" });
+    }
+
+    // eszközök: minimum 1, maximum 1000
+    const totalDevices = clampInt(devicesTotal, 1, 1000);
+
+    // 25 benne van, afölött extra
+    const included = 25;
+    const extraDevices = Math.max(0, totalDevices - included);
+
+    const monthlyPrice = getMonthlyPriceId(plan);
+    const devicePrice = getDevicePriceId(plan);
+
+    if (!monthlyPrice || !devicePrice) {
+      return res.status(500).json({ error: "Missing PRICE env vars for plan" });
+    }
+
+    const commitmentEndsAt = calcCommitmentEndsAt(term);
+
+    const lineItems = [
+      { price: monthlyPrice, quantity: 1 },
+    ];
+
+    if (extraDevices > 0) {
+      lineItems.push({ price: devicePrice, quantity: extraDevices });
+    }
+
+    // Setup fee csak 12 hónapnál (one-time price!)
+    if (term === 12) {
+      const setupFee = getSetupFeePriceId(plan);
+      if (!setupFee) {
+        return res.status(500).json({ error: "Missing setup fee price env var" });
+      }
+      lineItems.push({ price: setupFee, quantity: 1 });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: email,
+      line_items: lineItems,
+
+      success_url: `${process.env.WP_SUCCESS_URL}?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: process.env.WP_CANCEL_URL,
+
+      subscription_data: {
+        metadata: {
+          contractId: contractId ? String(contractId) : "",
+          plan: String(plan),
+          termMonths: String(term),
+          devicesTotal: String(totalDevices),
+          extraDevices: String(extraDevices),
+          commitmentEndsAt: String(commitmentEndsAt),
+        }
+      },
+
+      metadata: {
+        contractId: contractId ? String(contractId) : "",
+        plan: String(plan),
+        termMonths: String(term),
+        devicesTotal: String(totalDevices),
+        extraDevices: String(extraDevices),
+        commitmentEndsAt: String(commitmentEndsAt),
+      }
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error("create-checkout-session error:", err);
+    return res.status(500).json({
+      error: "Server error creating checkout session",
+      details: err?.message || String(err)
+    });
+  }
+});
+
+// ---------- Stripe Webhook (RAW BODY!) ----------
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error("Webhook signature verify failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    const db = await loadContracts();
+
+    const upsertBySubscription = async (subscriptionId, patch) => {
+      if (!subscriptionId) return;
+
+      const existing = db.bySubscriptionId[subscriptionId] || {};
+      const merged = { ...existing, ...patch, subscriptionId };
+
+      db.bySubscriptionId[subscriptionId] = merged;
+
+      if (merged.contractId) {
+        db.byContractId[merged.contractId] = {
+          ...(db.byContractId[merged.contractId] || {}),
+          ...merged
+        };
+      }
+
+      await saveContracts(db);
+    };
+
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+
+        const subscriptionId = session.subscription;
+        const customerId = session.customer;
+
+        console.log("✅ checkout.session.completed", {
+          email: session.customer_email,
+          subscription: subscriptionId,
+          metadata: session.metadata
+        });
+
+        await upsertBySubscription(subscriptionId, {
+          contractId: session.metadata?.contractId || "",
+          customerId: customerId || "",
+          email: session.customer_email || "",
+          plan: session.metadata?.plan || "",
+          termMonths: Number(session.metadata?.termMonths || 0),
+          devicesTotal: Number(session.metadata?.devicesTotal || 0),
+          extraDevices: Number(session.metadata?.extraDevices || 0),
+          commitmentEndsAt: Number(session.metadata?.commitmentEndsAt || 0),
+          status: "active",
+          lastEvent: "checkout.session.completed",
+          updatedAt: Date.now(),
+        });
+
+        break;
+      }
+
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+
+        const subscriptionId =
+          invoice.subscription ||
+          invoice.lines?.data?.[0]?.subscription ||
+          null;
+
+        console.log("✅ invoice.payment_succeeded", {
+          customer: invoice.customer,
+          subscription: subscriptionId,
+          amount_paid: invoice.amount_paid
+        });
+
+        await upsertBySubscription(subscriptionId, {
+          status: "active",
+          lastPaymentAt: Date.now(),
+          lastInvoiceId: invoice.id,
+          lastEvent: "invoice.payment_succeeded",
+          updatedAt: Date.now(),
+        });
+
+        break;
+      }
+
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+
+        const subscriptionId =
+          invoice.subscription ||
+          invoice.lines?.data?.[0]?.subscription ||
+          null;
+
+        console.log("❌ invoice.payment_failed", {
+          customer: invoice.customer,
+          subscription: subscriptionId
+        });
+
+        await upsertBySubscription(subscriptionId, {
+          status: "past_due",
+          lastEvent: "invoice.payment_failed",
+          updatedAt: Date.now(),
+        });
+
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+
+        console.log("🛑 subscription.deleted", { id: sub.id, status: sub.status });
+
+        await upsertBySubscription(sub.id, {
+          status: "canceled",
+          lastEvent: "customer.subscription.deleted",
+          updatedAt: Date.now(),
+        });
+
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    return res.json({ received: true });
+  } catch (err) {
+    console.error("Webhook handler error:", err);
+    return res.status(500).send("Webhook handler error");
+  }
+});
+
+// ---------- Success page helper: session status ----------
+app.get("/api/session-status", async (req, res) => {
+  try {
+    const sessionId = String(req.query.session_id || "").trim();
+    if (!sessionId) return res.status(400).json({ error: "Missing session_id" });
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["subscription", "line_items.data.price.product"]
+    });
+
+    const paid = session.payment_status === "paid" || session.status === "complete";
+
+    const metadata = session.metadata || {};
+    const sub = session.subscription && typeof session.subscription === "object"
+      ? session.subscription
+      : null;
+
+    const commitmentEndsAt = Number(metadata.commitmentEndsAt || 0);
+
+    const planLabel =
+      metadata.plan === "basic" ? "Alapcsomag" :
+      metadata.plan === "premium" ? "Prémiumcsomag" :
+      (metadata.plan || "");
+
+    const items = (session.line_items?.data || []).map(li => ({
+      description: li.description || li.price?.nickname || li.price?.id || "",
+      quantity: li.quantity || 0,
+      amount_total: li.amount_total || 0,
+      currency: li.currency || ""
+    }));
+
+    return res.json({
+      ok: true,
+      paid,
+      customer_email: session.customer_details?.email || session.customer_email || "",
+      session_id: session.id,
+      subscription_id: sub?.id || session.subscription || null,
+      subscription_status: sub?.status || null,
+      plan: metadata.plan || null,
+      planLabel,
+      termMonths: metadata.termMonths ? Number(metadata.termMonths) : null,
+      devicesTotal: metadata.devicesTotal ? Number(metadata.devicesTotal) : null,
+      extraDevices: metadata.extraDevices ? Number(metadata.extraDevices) : null,
+      commitmentEndsAt: commitmentEndsAt || null,
+      items
+    });
+  } catch (err) {
+    console.error("session-status error:", err);
+    return res.status(500).json({
+      error: "Server error",
+      details: err?.message || String(err)
+    });
+  }
+});
+app.get("/api/subscription-status", async (req, res) => {
+  try {
+    const subscriptionId = String(req.query.subscriptionId || "").trim();
+    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
+
+    const db = await loadContracts();
+    const row = db.bySubscriptionId[subscriptionId];
+
+    if (!row) return res.status(404).json({ error: "Unknown subscriptionId" });
+
+    return res.json({
+      ok: true,
+      subscriptionId,
+      email: row.email || "",
+      plan: row.plan || "",
+      termMonths: row.termMonths || null,
+      devicesTotal: row.devicesTotal || null,
+      extraDevices: row.extraDevices || null,
+      commitmentEndsAt: row.commitmentEndsAt || null,
+      cancelAtPeriodEnd: !!row.cancelAtPeriodEnd,
+      status: row.status || "",
+      updatedAt: row.updatedAt || null
+    });
+  } catch (err) {
+    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
+  }
+});
+
+
+// ---------- Cancel request (commitment után) ----------
+app.post("/api/request-cancel", async (req, res) => {
+  try {
+    const { subscriptionId, email } = req.body || {};
+    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
+
+    const db = await loadContracts();
+    const row = db.bySubscriptionId[subscriptionId];
+
+    if (!row) return res.status(404).json({ error: "Unknown subscriptionId" });
+
+    if (email && row.email && String(email).toLowerCase() !== String(row.email).toLowerCase()) {
+      return res.status(403).json({ error: "Email mismatch" });
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const commitmentEndsAt = Number(row.commitmentEndsAt || 0);
+
+    if (commitmentEndsAt && nowSec < commitmentEndsAt) {
+      return res.status(400).json({
+        error: "Commitment active - cannot cancel yet",
+        commitmentEndsAt
+      });
+    }
+
+    // Lemondás a következő periódus végére
+    const updated = await stripe.subscriptions.update(subscriptionId, {
+      cancel_at_period_end: true
+    });
+
+    row.cancelAtPeriodEnd = true;
+    row.cancelRequestedAt = Date.now();
+    row.updatedAt = Date.now();
+
+    db.bySubscriptionId[subscriptionId] = row;
+    if (row.contractId) db.byContractId[row.contractId] = row;
+
+    await saveContracts(db);
+
+    return res.json({
+      ok: true,
+      subscriptionId,
+      cancel_at_period_end: updated.cancel_at_period_end
+    });
+  } catch (err) {
+    console.error("request-cancel error:", err);
+    return res.status(500).json({
+      error: "Server error",
+      details: err?.message || String(err)
+    });
+  }
+});
+
+// ---------- Start ----------
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server running on :${port}`));
