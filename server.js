@@ -146,19 +146,16 @@ async function sendMailSafe({ to, subject, text }) {
 
 // ---------- Admin auth ----------
 function requireAdmin(req, res, next) {
-  const token =
-    (req.headers["x-admin-token"] ? String(req.headers["x-admin-token"]) : "") ||
-    (req.query.token ? String(req.query.token) : "");
+  const token = String(req.query.token || req.headers["x-admin-token"] || "");
 
   if (!process.env.ADMIN_TOKEN) {
-    return res.status(500).json({ error: "ADMIN_TOKEN not set on server" });
+    return res.status(500).json({ error: "Missing ADMIN_TOKEN env var" });
   }
-
   if (token !== process.env.ADMIN_TOKEN) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  return next();
+  next();
 }
 
 // ---------- Health ----------
@@ -167,25 +164,28 @@ app.get("/", (req, res) => {
 });
 
 // ---------- Admin: contracts list ----------
-app.get("/admin/contracts", requireAdmin, async (req, res) => {
+app.get("/api/admin/contracts", requireAdmin, async (req, res) => {
   try {
     const db = await loadContracts();
-    const rows = Object.values(db.bySubscriptionId || {}).sort(
-      (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)
-    );
-    return res.json({ ok: true, count: rows.length, rows });
+    const items = Object.values(db.bySubscriptionId || {});
+    items.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    return res.json({ ok: true, count: items.length, items });
   } catch (e) {
     return res.status(500).json({ error: "Server error", details: e?.message || String(e) });
   }
 });
 
-app.get("/admin/contracts/:subscriptionId", requireAdmin, async (req, res) => {
+// ---------- Admin: one contract by subscriptionId ----------
+app.get("/api/admin/contract", requireAdmin, async (req, res) => {
   try {
-    const subscriptionId = String(req.params.subscriptionId || "").trim();
+    const subscriptionId = String(req.query.subscriptionId || "").trim();
+    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
+
     const db = await loadContracts();
-    const row = db.bySubscriptionId[subscriptionId];
+    const row = db.bySubscriptionId?.[subscriptionId];
     if (!row) return res.status(404).json({ error: "Not found" });
-    return res.json({ ok: true, row });
+
+    return res.json({ ok: true, item: row });
   } catch (e) {
     return res.status(500).json({ error: "Server error", details: e?.message || String(e) });
   }
@@ -208,10 +208,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
       return res.status(400).json({ error: "Invalid termMonths (12 or 36)" });
     }
 
-    // eszközök: minimum 1, maximum 1000
     const totalDevices = clampInt(devicesTotal, 1, 1000);
-
-    // 25 benne van, afölött extra
     const included = 25;
     const extraDevices = Math.max(0, totalDevices - included);
 
@@ -230,7 +227,6 @@ app.post("/api/create-checkout-session", async (req, res) => {
       lineItems.push({ price: devicePrice, quantity: extraDevices });
     }
 
-    // Setup fee csak 12 hónapnál (one-time price!)
     if (term === 12) {
       const setupFee = getSetupFeePriceId(plan);
       if (!setupFee) {
@@ -321,7 +317,6 @@ app.post(
       switch (event.type) {
         case "checkout.session.completed": {
           const session = event.data.object;
-
           const subscriptionId = session.subscription;
           const customerId = session.customer;
 
@@ -392,8 +387,6 @@ app.post(
             updatedAt: Date.now(),
           });
 
-          // Email: sikeres számla (opcionális, nem spam-eljük túl)
-          // Ha akarod, bekapcsoljuk külön flaggel.
           break;
         }
 
@@ -506,7 +499,7 @@ app.get("/api/subscription-status", async (req, res) => {
     if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
 
     const db = await loadContracts();
-    const row = db.bySubscriptionId[subscriptionId];
+    const row = db.bySubscriptionId?.[subscriptionId];
 
     if (!row) return res.status(404).json({ error: "Unknown subscriptionId" });
 
@@ -532,17 +525,45 @@ app.get("/api/subscription-status", async (req, res) => {
   }
 });
 
-// ---------- Cancel request (commitment után) ----------
+// ---------- Cancel request (Stripe fallback!) ----------
 app.post("/api/request-cancel", async (req, res) => {
   try {
     const { subscriptionId, email } = req.body || {};
-    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
+    const sid = String(subscriptionId || "").trim();
+    if (!sid) return res.status(400).json({ error: "Missing subscriptionId" });
 
     const db = await loadContracts();
-    const row = db.bySubscriptionId[subscriptionId];
+    let row = db.bySubscriptionId?.[sid] || null;
 
-    if (!row) return res.status(404).json({ error: "Unknown subscriptionId" });
+    // 1) Ha NINCS a JSON-ban -> Stripe fallback
+    if (!row) {
+      // Stripe-ból lekérjük az előfizetést
+      const sub = await stripe.subscriptions.retrieve(sid);
 
+      // ha adtál emailt, ellenőrizzük a Stripe customer emailt (ha van)
+      if (email) {
+        const cust = await stripe.customers.retrieve(sub.customer);
+        const custEmail = String(cust?.email || "").toLowerCase();
+        const given = String(email).toLowerCase();
+
+        if (custEmail && custEmail !== given) {
+          return res.status(403).json({ error: "Email mismatch" });
+        }
+      }
+
+      const updated = await stripe.subscriptions.update(sid, {
+        cancel_at_period_end: true,
+      });
+
+      return res.json({
+        ok: true,
+        subscriptionId: sid,
+        cancel_at_period_end: updated.cancel_at_period_end,
+        note: "Canceled via Stripe fallback (not found in contracts.json)",
+      });
+    }
+
+    // 2) Ha megvan a JSON-ban -> megy a commitment check
     if (email && row.email && String(email).toLowerCase() !== String(row.email).toLowerCase()) {
       return res.status(403).json({ error: "Email mismatch" });
     }
@@ -557,8 +578,7 @@ app.post("/api/request-cancel", async (req, res) => {
       });
     }
 
-    // Lemondás a következő periódus végére
-    const updated = await stripe.subscriptions.update(subscriptionId, {
+    const updated = await stripe.subscriptions.update(sid, {
       cancel_at_period_end: true,
     });
 
@@ -566,7 +586,7 @@ app.post("/api/request-cancel", async (req, res) => {
     row.cancelRequestedAt = Date.now();
     row.updatedAt = Date.now();
 
-    db.bySubscriptionId[subscriptionId] = row;
+    db.bySubscriptionId[sid] = row;
     if (row.contractId) db.byContractId[row.contractId] = row;
 
     await saveContracts(db);
@@ -578,7 +598,7 @@ app.post("/api/request-cancel", async (req, res) => {
         subject: "Quantum ITech - Lemondás rögzítve",
         text:
           "A lemondási kérésedet rögzítettük.\n\n" +
-          "Előfizetés azonosító: " + subscriptionId + "\n" +
+          "Előfizetés azonosító: " + sid + "\n" +
           "Lemondás a periódus végén: " + String(updated.cancel_at_period_end) + "\n\n" +
           "Köszönjük,\nQuantum ITech",
       });
@@ -586,7 +606,7 @@ app.post("/api/request-cancel", async (req, res) => {
 
     return res.json({
       ok: true,
-      subscriptionId,
+      subscriptionId: sid,
       cancel_at_period_end: updated.cancel_at_period_end,
     });
   } catch (err) {
