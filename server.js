@@ -5,6 +5,7 @@ const cors = require("cors");
 const fs = require("fs-extra");
 const path = require("path");
 const Stripe = require("stripe");
+const nodemailer = require("nodemailer");
 
 const app = express();
 
@@ -33,6 +34,14 @@ app.use(
     credentials: true,
   })
 );
+
+// ---------- JSON body (NEM webhookhoz!) ----------
+// Webhook RAW kell -> azt külön route kezeli.
+// Itt kivesszük a webhook útvonalat a JSON parserből.
+app.use((req, res, next) => {
+  if (req.originalUrl === "/api/stripe/webhook") return next();
+  return express.json()(req, res, next);
+});
 
 // ---------- “DB” (JSON fájl) ----------
 const DATA_DIR = path.join(__dirname, "data");
@@ -85,160 +94,101 @@ function getSetupFeePriceId(plan) {
 }
 
 // commitment vége unix timestamp (másodperc)
+// (Egyszerű közelítés 30 napos hónapokkal)
 function calcCommitmentEndsAt(termMonths) {
   const nowSec = Math.floor(Date.now() / 1000);
   return nowSec + termMonths * 30 * 24 * 60 * 60;
 }
 
-// ---------- Stripe Webhook handler (közös) ----------
-async function handleStripeWebhook(req, res) {
-  const sig = req.headers["stripe-signature"];
-  let event;
+function planLabel(plan) {
+  if (plan === "basic") return "Alapcsomag";
+  if (plan === "premium") return "Prémiumcsomag";
+  return plan || "";
+}
 
+// ---------- Email (SMTP) ----------
+function getMailer() {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+
+  if (!host || !user || !pass) return null;
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: port === 465,
+    auth: { user, pass },
+  });
+}
+
+async function sendMailSafe({ to, subject, text }) {
   try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error("Webhook signature verify failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
-  }
-
-  try {
-    const db = await loadContracts();
-
-    const upsertBySubscription = async (subscriptionId, patch) => {
-      if (!subscriptionId) return;
-
-      const existing = db.bySubscriptionId[subscriptionId] || {};
-      const merged = { ...existing, ...patch, subscriptionId };
-
-      db.bySubscriptionId[subscriptionId] = merged;
-
-      if (merged.contractId) {
-        db.byContractId[merged.contractId] = {
-          ...(db.byContractId[merged.contractId] || {}),
-          ...merged,
-        };
-      }
-
-      await saveContracts(db);
-    };
-
-    switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object;
-
-        const subscriptionId = session.subscription;
-        const customerId = session.customer;
-
-        console.log("✅ checkout.session.completed", {
-          email: session.customer_email,
-          subscription: subscriptionId,
-          metadata: session.metadata,
-        });
-
-        await upsertBySubscription(subscriptionId, {
-          contractId: session.metadata?.contractId || "",
-          customerId: customerId || "",
-          email: session.customer_email || "",
-          plan: session.metadata?.plan || "",
-          termMonths: Number(session.metadata?.termMonths || 0),
-          devicesTotal: Number(session.metadata?.devicesTotal || 0),
-          extraDevices: Number(session.metadata?.extraDevices || 0),
-          commitmentEndsAt: Number(session.metadata?.commitmentEndsAt || 0),
-          status: "active",
-          lastEvent: "checkout.session.completed",
-          updatedAt: Date.now(),
-        });
-
-        break;
-      }
-
-      case "invoice.payment_succeeded": {
-        const invoice = event.data.object;
-
-        const subscriptionId =
-          invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
-
-        console.log("✅ invoice.payment_succeeded", {
-          customer: invoice.customer,
-          subscription: subscriptionId,
-          amount_paid: invoice.amount_paid,
-        });
-
-        await upsertBySubscription(subscriptionId, {
-          status: "active",
-          lastPaymentAt: Date.now(),
-          lastInvoiceId: invoice.id,
-          lastEvent: "invoice.payment_succeeded",
-          updatedAt: Date.now(),
-        });
-
-        break;
-      }
-
-      case "invoice.payment_failed": {
-        const invoice = event.data.object;
-
-        const subscriptionId =
-          invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
-
-        console.log("❌ invoice.payment_failed", {
-          customer: invoice.customer,
-          subscription: subscriptionId,
-        });
-
-        await upsertBySubscription(subscriptionId, {
-          status: "past_due",
-          lastEvent: "invoice.payment_failed",
-          updatedAt: Date.now(),
-        });
-
-        break;
-      }
-
-      case "customer.subscription.deleted": {
-        const sub = event.data.object;
-
-        console.log("🛑 subscription.deleted", { id: sub.id, status: sub.status });
-
-        await upsertBySubscription(sub.id, {
-          status: "canceled",
-          lastEvent: "customer.subscription.deleted",
-          updatedAt: Date.now(),
-        });
-
-        break;
-      }
-
-      default:
-        // nem baj, ha mást nem kezelsz, csak 200-at adj vissza
-        break;
+    const transporter = getMailer();
+    if (!transporter) {
+      console.log("MAIL: SMTP not configured, skipping email send.");
+      return;
     }
 
-    return res.status(200).json({ received: true });
-  } catch (err) {
-    console.error("Webhook handler error:", err);
-    return res.status(500).send("Webhook handler error");
+    await transporter.sendMail({
+      from: process.env.MAIL_FROM || "no-reply@example.com",
+      to,
+      subject,
+      text,
+    });
+
+    console.log("MAIL: sent to", to);
+  } catch (e) {
+    console.error("MAIL: send failed:", e?.message || e);
   }
 }
 
-// ---------- WEBHOOK ROUTES RAW BODY-val (FONTOS: még a JSON parser előtt!) ----------
-// Ez az, amit a Stripe-ban beállítottál:
-app.post("/api/webhook", express.raw({ type: "application/json" }), handleStripeWebhook);
+// ---------- Admin auth ----------
+function requireAdmin(req, res, next) {
+  const token =
+    (req.headers["x-admin-token"] ? String(req.headers["x-admin-token"]) : "") ||
+    (req.query.token ? String(req.query.token) : "");
 
-// Meghagyjuk kompatibilitás miatt a régi utat is:
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), handleStripeWebhook);
+  if (!process.env.ADMIN_TOKEN) {
+    return res.status(500).json({ error: "ADMIN_TOKEN not set on server" });
+  }
 
-// ---------- JSON body a többi route-hoz ----------
-app.use(express.json());
+  if (token !== process.env.ADMIN_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  return next();
+}
 
 // ---------- Health ----------
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "quantum-stripe-backend" });
+});
+
+// ---------- Admin: contracts list ----------
+app.get("/admin/contracts", requireAdmin, async (req, res) => {
+  try {
+    const db = await loadContracts();
+    const rows = Object.values(db.bySubscriptionId || {}).sort(
+      (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)
+    );
+    return res.json({ ok: true, count: rows.length, rows });
+  } catch (e) {
+    return res.status(500).json({ error: "Server error", details: e?.message || String(e) });
+  }
+});
+
+app.get("/admin/contracts/:subscriptionId", requireAdmin, async (req, res) => {
+  try {
+    const subscriptionId = String(req.params.subscriptionId || "").trim();
+    const db = await loadContracts();
+    const row = db.bySubscriptionId[subscriptionId];
+    if (!row) return res.status(404).json({ error: "Not found" });
+    return res.json({ ok: true, row });
+  } catch (e) {
+    return res.status(500).json({ error: "Server error", details: e?.message || String(e) });
+  }
 });
 
 // ---------- Create Checkout Session ----------
@@ -258,8 +208,10 @@ app.post("/api/create-checkout-session", async (req, res) => {
       return res.status(400).json({ error: "Invalid termMonths (12 or 36)" });
     }
 
+    // eszközök: minimum 1, maximum 1000
     const totalDevices = clampInt(devicesTotal, 1, 1000);
 
+    // 25 benne van, afölött extra
     const included = 25;
     const extraDevices = Math.max(0, totalDevices - included);
 
@@ -278,6 +230,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
       lineItems.push({ price: devicePrice, quantity: extraDevices });
     }
 
+    // Setup fee csak 12 hónapnál (one-time price!)
     if (term === 12) {
       const setupFee = getSetupFeePriceId(plan);
       if (!setupFee) {
@@ -325,6 +278,176 @@ app.post("/api/create-checkout-session", async (req, res) => {
   }
 });
 
+// ---------- Stripe Webhook (RAW BODY!) ----------
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("Webhook signature verify failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      const db = await loadContracts();
+
+      const upsertBySubscription = async (subscriptionId, patch) => {
+        if (!subscriptionId) return;
+
+        const existing = db.bySubscriptionId[subscriptionId] || {};
+        const merged = { ...existing, ...patch, subscriptionId };
+
+        db.bySubscriptionId[subscriptionId] = merged;
+
+        if (merged.contractId) {
+          db.byContractId[merged.contractId] = {
+            ...(db.byContractId[merged.contractId] || {}),
+            ...merged,
+          };
+        }
+
+        await saveContracts(db);
+      };
+
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const session = event.data.object;
+
+          const subscriptionId = session.subscription;
+          const customerId = session.customer;
+
+          console.log("checkout.session.completed", {
+            email: session.customer_email,
+            subscription: subscriptionId,
+            metadata: session.metadata,
+          });
+
+          await upsertBySubscription(subscriptionId, {
+            contractId: session.metadata?.contractId || "",
+            customerId: customerId || "",
+            email: session.customer_email || "",
+            plan: session.metadata?.plan || "",
+            termMonths: Number(session.metadata?.termMonths || 0),
+            devicesTotal: Number(session.metadata?.devicesTotal || 0),
+            extraDevices: Number(session.metadata?.extraDevices || 0),
+            commitmentEndsAt: Number(session.metadata?.commitmentEndsAt || 0),
+            status: "active",
+            lastEvent: "checkout.session.completed",
+            updatedAt: Date.now(),
+          });
+
+          // Email: megrendelés visszaigazolás
+          const to = session.customer_email || "";
+          if (to) {
+            const p = session.metadata?.plan || "";
+            const tm = session.metadata?.termMonths || "";
+            const dv = session.metadata?.devicesTotal || "";
+            const ce = session.metadata?.commitmentEndsAt || "";
+
+            await sendMailSafe({
+              to,
+              subject: "Quantum ITech - Sikeres előfizetés",
+              text:
+                "Sikeres fizetés és előfizetés létrejött.\n\n" +
+                "Csomag: " + planLabel(p) + "\n" +
+                "Szerződés hossza (hó): " + tm + "\n" +
+                "Eszközök száma: " + dv + "\n" +
+                "Előfizetés azonosító: " + subscriptionId + "\n" +
+                "Minimum szerződés vége (unix sec): " + ce + "\n\n" +
+                "Köszönjük,\nQuantum ITech",
+            });
+          }
+
+          break;
+        }
+
+        case "invoice.payment_succeeded": {
+          const invoice = event.data.object;
+
+          const subscriptionId =
+            invoice.subscription ||
+            invoice.lines?.data?.[0]?.subscription ||
+            null;
+
+          console.log("invoice.payment_succeeded", {
+            customer: invoice.customer,
+            subscription: subscriptionId,
+            amount_paid: invoice.amount_paid,
+          });
+
+          await upsertBySubscription(subscriptionId, {
+            status: "active",
+            lastPaymentAt: Date.now(),
+            lastInvoiceId: invoice.id,
+            lastEvent: "invoice.payment_succeeded",
+            updatedAt: Date.now(),
+          });
+
+          // Email: sikeres számla (opcionális, nem spam-eljük túl)
+          // Ha akarod, bekapcsoljuk külön flaggel.
+          break;
+        }
+
+        case "invoice.payment_failed": {
+          const invoice = event.data.object;
+
+          const subscriptionId =
+            invoice.subscription ||
+            invoice.lines?.data?.[0]?.subscription ||
+            null;
+
+          console.log("invoice.payment_failed", {
+            customer: invoice.customer,
+            subscription: subscriptionId,
+          });
+
+          await upsertBySubscription(subscriptionId, {
+            status: "past_due",
+            lastEvent: "invoice.payment_failed",
+            updatedAt: Date.now(),
+          });
+
+          break;
+        }
+
+        case "customer.subscription.deleted": {
+          const sub = event.data.object;
+
+          console.log("customer.subscription.deleted", {
+            id: sub.id,
+            status: sub.status,
+          });
+
+          await upsertBySubscription(sub.id, {
+            status: "canceled",
+            lastEvent: "customer.subscription.deleted",
+            updatedAt: Date.now(),
+          });
+
+          break;
+        }
+
+        default:
+          break;
+      }
+
+      return res.json({ received: true });
+    } catch (err) {
+      console.error("Webhook handler error:", err);
+      return res.status(500).send("Webhook handler error");
+    }
+  }
+);
+
 // ---------- Success page helper: session status ----------
 app.get("/api/session-status", async (req, res) => {
   try {
@@ -345,13 +468,6 @@ app.get("/api/session-status", async (req, res) => {
 
     const commitmentEndsAt = Number(metadata.commitmentEndsAt || 0);
 
-    const planLabel =
-      metadata.plan === "basic"
-        ? "Alapcsomag"
-        : metadata.plan === "premium"
-        ? "Prémiumcsomag"
-        : metadata.plan || "";
-
     const items = (session.line_items?.data || []).map((li) => ({
       description: li.description || li.price?.nickname || li.price?.id || "",
       quantity: li.quantity || 0,
@@ -367,7 +483,7 @@ app.get("/api/session-status", async (req, res) => {
       subscription_id: sub?.id || session.subscription || null,
       subscription_status: sub?.status || null,
       plan: metadata.plan || null,
-      planLabel,
+      planLabel: planLabel(metadata.plan || ""),
       termMonths: metadata.termMonths ? Number(metadata.termMonths) : null,
       devicesTotal: metadata.devicesTotal ? Number(metadata.devicesTotal) : null,
       extraDevices: metadata.extraDevices ? Number(metadata.extraDevices) : null,
@@ -383,6 +499,7 @@ app.get("/api/session-status", async (req, res) => {
   }
 });
 
+// ---------- Subscription status from local DB ----------
 app.get("/api/subscription-status", async (req, res) => {
   try {
     const subscriptionId = String(req.query.subscriptionId || "").trim();
@@ -398,6 +515,7 @@ app.get("/api/subscription-status", async (req, res) => {
       subscriptionId,
       email: row.email || "",
       plan: row.plan || "",
+      planLabel: planLabel(row.plan || ""),
       termMonths: row.termMonths || null,
       devicesTotal: row.devicesTotal || null,
       extraDevices: row.extraDevices || null,
@@ -407,7 +525,10 @@ app.get("/api/subscription-status", async (req, res) => {
       updatedAt: row.updatedAt || null,
     });
   } catch (err) {
-    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
+    return res.status(500).json({
+      error: "Server error",
+      details: err?.message || String(err),
+    });
   }
 });
 
@@ -436,6 +557,7 @@ app.post("/api/request-cancel", async (req, res) => {
       });
     }
 
+    // Lemondás a következő periódus végére
     const updated = await stripe.subscriptions.update(subscriptionId, {
       cancel_at_period_end: true,
     });
@@ -448,6 +570,19 @@ app.post("/api/request-cancel", async (req, res) => {
     if (row.contractId) db.byContractId[row.contractId] = row;
 
     await saveContracts(db);
+
+    // Email: lemondási visszaigazolás
+    if (row.email) {
+      await sendMailSafe({
+        to: row.email,
+        subject: "Quantum ITech - Lemondás rögzítve",
+        text:
+          "A lemondási kérésedet rögzítettük.\n\n" +
+          "Előfizetés azonosító: " + subscriptionId + "\n" +
+          "Lemondás a periódus végén: " + String(updated.cancel_at_period_end) + "\n\n" +
+          "Köszönjük,\nQuantum ITech",
+      });
+    }
 
     return res.json({
       ok: true,
