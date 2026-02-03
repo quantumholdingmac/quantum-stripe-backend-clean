@@ -1,3 +1,4 @@
+// server.js
 require("dotenv").config();
 
 const express = require("express");
@@ -6,6 +7,7 @@ const fs = require("fs-extra");
 const path = require("path");
 const Stripe = require("stripe");
 const nodemailer = require("nodemailer");
+const crypto = require("crypto");
 
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -115,6 +117,65 @@ function planLabel(plan) {
   if (plan === "basic") return "Alapcsomag";
   if (plan === "premium") return "Prémiumcsomag";
   return plan || "";
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function b64urlEncode(bufOrStr) {
+  const buf = Buffer.isBuffer(bufOrStr) ? bufOrStr : Buffer.from(String(bufOrStr), "utf8");
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function b64urlDecode(str) {
+  str = String(str || "").replace(/-/g, "+").replace(/_/g, "/");
+  while (str.length % 4) str += "=";
+  return Buffer.from(str, "base64");
+}
+
+// token payload: email|exp|nonce
+function signMagicToken(email, ttlSeconds = 600) {
+  const secret = process.env.MAGIC_LINK_SECRET;
+  if (!secret) throw new Error("MAGIC_LINK_SECRET missing");
+
+  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const nonce = crypto.randomBytes(12).toString("hex");
+  const payload = `${email}|${exp}|${nonce}`;
+  const sig = crypto.createHmac("sha256", secret).update(payload).digest();
+  return b64urlEncode(payload) + "." + b64urlEncode(sig);
+}
+
+function verifyMagicToken(token) {
+  const secret = process.env.MAGIC_LINK_SECRET;
+  if (!secret) throw new Error("MAGIC_LINK_SECRET missing");
+
+  const parts = String(token || "").split(".");
+  if (parts.length !== 2) throw new Error("Bad token format");
+
+  const payload = b64urlDecode(parts[0]).toString("utf8");
+  const sig = b64urlDecode(parts[1]);
+
+  const expected = crypto.createHmac("sha256", secret).update(payload).digest();
+
+  if (sig.length !== expected.length || !crypto.timingSafeEqual(sig, expected)) {
+    throw new Error("Bad token signature");
+  }
+
+  const [email, expStr] = payload.split("|");
+  const exp = Number(expStr || 0);
+  if (!email || !exp) throw new Error("Bad token payload");
+
+  const now = Math.floor(Date.now() / 1000);
+  if (exp < now) throw new Error("Token expired");
+
+  return { email: normalizeEmail(email), exp };
+}
+
+// Stripe: find customer by email (returns first)
+async function findCustomerByEmail(email) {
+  if (!email) return null;
+  const res = await stripe.customers.list({ email: normalizeEmail(email), limit: 1 });
+  return res.data && res.data.length ? res.data[0] : null;
 }
 
 // -------------------- EMAIL (SMTP optional) --------------------
@@ -451,9 +512,9 @@ app.get("/api/admin/contract", requireAdmin, async (req, res) => {
         plan: sub.metadata?.plan || "",
         planLabel: planLabel(sub.metadata?.plan || ""),
         termMonths: sub.metadata?.termMonths ? Number(sub.metadata.termMonths) : null,
-        devicesTotal: sub.metadata?.devicesTotal ? Number(sub.metadata.devicesTotal) : null,
-        extraDevices: sub.metadata?.extraDevices ? Number(sub.metadata.extraDevices) : null,
-        commitmentEndsAt: sub.metadata?.commitmentEndsAt ? Number(sub.metadata.commitmentEndsAt) : null,
+        devicesTotal: sub.metadata?.devicesTotal ? Number(sub.metadata?.devicesTotal) : null,
+        extraDevices: sub.metadata?.extraDevices ? Number(sub.metadata?.extraDevices) : null,
+        commitmentEndsAt: sub.metadata?.commitmentEndsAt ? Number(sub.metadata?.commitmentEndsAt) : null,
       },
     });
   } catch (e) {
@@ -655,6 +716,7 @@ app.post("/api/request-cancel", async (req, res) => {
     return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
   }
 });
+
 // ---------- Customer Portal session (Stripe Customer Portal) ----------
 app.post("/api/create-portal-session", async (req, res) => {
   try {
@@ -727,6 +789,90 @@ app.post("/api/create-portal-session", async (req, res) => {
   }
 });
 
+// -------------------- NEW: MAGIC-LINK PORTAL FLOW --------------------
+// POST /api/portal/magic-request  { email }
+// GET  /api/portal/magic?token=...  -> redirect to portal
+// --------------------
+
+app.post("/api/portal/magic-request", async (req, res) => {
+  try {
+    const emailRaw = req.body && req.body.email;
+    const email = normalizeEmail(emailRaw);
+    if (!email || !email.includes("@")) {
+      return res.status(400).json({ ok: false, error: "Invalid email" });
+    }
+
+    // Find Stripe customer
+    const customer = await findCustomerByEmail(email);
+
+    // Always return generic ok to avoid email enumeration,
+    // but only send email if customer exists.
+    if (customer) {
+      // sign token (10 minutes)
+      const token = signMagicToken(email, 10 * 60);
+      // Build magic URL - use request host + protocol so Render path works.
+      // If you prefer absolute external URL, set FRONTEND_BASE env and use it.
+      const host = req.get("host");
+      const proto = req.protocol || "https";
+      const magicUrl = `${proto}://${host}/api/portal/magic?token=${encodeURIComponent(token)}`;
+
+      const subject = "Quantum ITech - Belépő link az ügyfélportálhoz";
+      const text =
+`Szia!
+
+Kattints a lenti linkre az ügyfélportál megnyitásához (a link 10 percig érvényes):
+${magicUrl}
+
+Ha nem te kérted, hagyd figyelmen kívül ezt az üzenetet.
+
+Üdv,
+Quantum ITech`;
+
+      // send via configured SMTP (if available)
+      await sendMailSafe({ to: email, subject, text });
+    }
+
+    return res.json({
+      ok: true,
+      message: "Ha létezik előfizetés ehhez az emailhez, elküldtük a belépő linket."
+    });
+  } catch (e) {
+    console.error("magic-request error:", e);
+    return res.status(500).json({ ok: false, error: "Server error", details: e?.message || String(e) });
+  }
+});
+
+app.get("/api/portal/magic", async (req, res) => {
+  try {
+    const token = String(req.query.token || "");
+    if (!token) return res.status(400).send("Missing token");
+
+    const { email } = verifyMagicToken(token);
+
+    // Find Stripe customer
+    const customer = await findCustomerByEmail(email);
+    if (!customer) {
+      // Redirect to frontend portal page with error query (or show text)
+      const returnUrl = process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "/";
+      // Optionally attach error query
+      return res.redirect(`${returnUrl}?portal_error=no_customer`);
+    }
+
+    const returnUrl = process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "https://quantumitech.hu/";
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customer.id,
+      return_url: returnUrl
+    });
+
+    return res.redirect(302, session.url);
+  } catch (e) {
+    console.error("magic consume error:", e?.message || e);
+    // Redirect back to portal page with error param to show message
+    const returnUrl = process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "/";
+    return res.redirect(`${returnUrl}?portal_error=invalid_token`);
+  }
+});
 
 // -------------------- START --------------------
 const port = process.env.PORT || 3000;
