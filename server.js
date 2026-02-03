@@ -716,6 +716,78 @@ app.post("/api/request-cancel", async (req, res) => {
     return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
   }
 });
+// ---------- Customer Portal session (Stripe Customer Portal) ----------
+app.post("/api/create-portal-session", async (req, res) => {
+  try {
+    const { session_id, subscriptionId, email } = req.body || {};
+
+    let customerId = null;
+
+    // A) Ha van session_id (success oldalról a legjobb)
+    if (session_id) {
+      const session = await stripe.checkout.sessions.retrieve(String(session_id), {
+        expand: ["subscription"],
+      });
+
+      customerId =
+        (typeof session.customer === "string" && session.customer) ||
+        (session.customer && session.customer.id) ||
+        null;
+
+      // fallback: ha customerId még sincs
+      if (!customerId && session.subscription) {
+        const subId =
+          typeof session.subscription === "string"
+            ? session.subscription
+            : session.subscription.id;
+
+        const sub = await stripe.subscriptions.retrieve(subId);
+        customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id || null;
+      }
+    }
+
+    // B) Ha nincs session_id, de van subscriptionId (és/vagy email)
+    if (!customerId && subscriptionId) {
+      // 1) próbáljuk a helyi JSON-ból (ha van nálad db)
+      try {
+        const db = await loadContracts();
+        const row = db.bySubscriptionId?.[String(subscriptionId)];
+        if (row && row.customerId) customerId = String(row.customerId);
+        // ha email megadva, ellenőrizheted (opcionális)
+        if (row && email && row.email && String(email).toLowerCase() !== String(row.email).toLowerCase()) {
+          return res.status(403).json({ error: "Email mismatch" });
+        }
+      } catch (_) {}
+
+      // 2) Stripe fallback: subscription-ből kinyerjük a customer-t
+      if (!customerId) {
+        const sub = await stripe.subscriptions.retrieve(String(subscriptionId));
+        customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id || null;
+      }
+    }
+
+    if (!customerId) {
+      return res.status(400).json({
+        error: "Missing customer",
+        details: "Adj meg session_id-t vagy subscriptionId-t.",
+      });
+    }
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "https://quantumitech.hu/",
+    }); // :contentReference[oaicite:1]{index=1}
+
+    return res.json({ url: portalSession.url });
+  } catch (err) {
+    console.error("create-portal-session error:", err);
+    return res.status(500).json({
+      error: "Server error",
+      details: err?.message || String(err),
+    });
+  }
+});
+
 
 // ---------- Customer Portal session (Stripe Customer Portal) ----------
 app.post("/api/create-portal-session", async (req, res) => {
