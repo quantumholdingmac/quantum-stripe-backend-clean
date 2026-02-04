@@ -848,13 +848,13 @@ app.post("/api/portal/magic-request", async (req, res) => {
 
       // ha akarod fixen a WP domainből menjen, add meg env-ben:
       // FRONTEND_BASE=https://quantumitech.hu
-      const base = process.env.FRONTEND_BASE;
-      const host = req.get("host");
-      const proto = req.protocol || "https";
+    
+      
       const apiBase = base ? base.replace(/\/+$/g, "") : `${proto}://${host}`;
+    const base = (process.env.FRONTEND_BASE || "").replace(/\/+$/, "");
+    const magicUrl = `${base}/api/portal/magic?token=${encodeURIComponent(token)}`;
 
-      const magicUrl = `${apiBase}/api/portal/magic?token=${encodeURIComponent(token)}`;
-
+      
       const subject = "Quantum ITech - Belépő link az ügyfélportálhoz";
       const text =
 `Szia!
