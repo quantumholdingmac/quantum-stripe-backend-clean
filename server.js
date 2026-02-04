@@ -6,11 +6,37 @@ const cors = require("cors");
 const fs = require("fs-extra");
 const path = require("path");
 const Stripe = require("stripe");
-const nodemailer = require("nodemailer");
 const crypto = require("crypto");
+const { Resend } = require("resend");
 
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// -------------------- RESEND --------------------
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+
+async function sendMailSafe({ to, subject, text, html }) {
+  try {
+    if (!resend) {
+      console.log("MAIL: RESEND_API_KEY not configured -> skip");
+      return;
+    }
+
+    const from = process.env.MAIL_FROM || "Quantum ITech <info@quantumitech.hu>";
+
+    await resend.emails.send({
+      from,
+      to,
+      subject,
+      text,
+      html,
+    });
+
+    console.log("MAIL: sent via Resend to", to);
+  } catch (e) {
+    console.error("MAIL: failed:", e?.message || e);
+  }
+}
 
 // -------------------- CORS --------------------
 const corsOrigins = (process.env.CORS_ORIGINS || "")
@@ -178,42 +204,6 @@ async function findCustomerByEmail(email) {
   return res.data && res.data.length ? res.data[0] : null;
 }
 
-// -------------------- EMAIL (SMTP optional) --------------------
-function getMailer() {
-  const host = process.env.SMTP_HOST;
-  const port = Number(process.env.SMTP_PORT || "587");
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-
-  if (!host || !user || !pass) return null;
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass },
-  });
-}
-
-async function sendMailSafe({ to, subject, text }) {
-  try {
-    const transporter = getMailer();
-    if (!transporter) {
-      console.log("MAIL: SMTP not configured -> skip");
-      return;
-    }
-    await transporter.sendMail({
-      from: process.env.MAIL_FROM || "no-reply@example.com",
-      to,
-      subject,
-      text,
-    });
-    console.log("MAIL: sent to", to);
-  } catch (e) {
-    console.error("MAIL: failed:", e?.message || e);
-  }
-}
-
 // -------------------- ADMIN AUTH --------------------
 function requireAdmin(req, res, next) {
   const token =
@@ -322,7 +312,6 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // fontos: sose 500-azzunk fájlírás miatt -> külön try/catch
   let db;
   try {
     db = await loadContracts();
@@ -349,7 +338,6 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       await saveContracts(db);
     } catch (e) {
       console.error("DB save failed (non-fatal):", e?.message || e);
-      // nem dobunk tovább -> Stripe kapjon 200-at
     }
   };
 
@@ -439,7 +427,6 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     return res.json({ received: true });
   } catch (err) {
     console.error("Webhook handler error:", err);
-    // még itt is inkább 200, hogy Stripe ne pörgesse végtelen újraküldéssel
     return res.json({ received: true, warning: "handler error (logged)" });
   }
 });
@@ -447,7 +434,6 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 // -------------------- ADMIN API (JSON + Stripe fallback) --------------------
 app.get("/api/admin/contracts", requireAdmin, async (req, res) => {
   try {
-    // 1) próbáljuk helyi DB-ből
     let local = [];
     try {
       const db = await loadContracts();
@@ -458,8 +444,6 @@ app.get("/api/admin/contracts", requireAdmin, async (req, res) => {
       local = [];
     }
 
-    // 2) ha üres, kérhetünk Stripe listát is (opcionális)
-    // query: ?source=stripe
     const source = String(req.query.source || "").toLowerCase();
     if (source === "stripe") {
       const subs = await stripe.subscriptions.list({ limit: 100 });
@@ -490,14 +474,12 @@ app.get("/api/admin/contract", requireAdmin, async (req, res) => {
     const subscriptionId = String(req.query.subscriptionId || "").trim();
     if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
 
-    // local
     try {
       const db = await loadContracts();
       const row = db.bySubscriptionId?.[subscriptionId];
       if (row) return res.json({ ok: true, source: "local", item: row });
     } catch (_) {}
 
-    // stripe fallback
     const sub = await stripe.subscriptions.retrieve(subscriptionId);
     return res.json({
       ok: true,
@@ -571,7 +553,6 @@ app.get("/api/subscription-status", async (req, res) => {
     const subscriptionId = String(req.query.subscriptionId || "").trim();
     if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
 
-    // 1) local
     try {
       const db = await loadContracts();
       const row = db.bySubscriptionId?.[subscriptionId];
@@ -594,7 +575,6 @@ app.get("/api/subscription-status", async (req, res) => {
       }
     } catch (_) {}
 
-    // 2) stripe fallback
     const sub = await stripe.subscriptions.retrieve(subscriptionId);
     return res.json({
       ok: true,
@@ -622,7 +602,6 @@ app.post("/api/request-cancel", async (req, res) => {
     const { subscriptionId, email } = req.body || {};
     if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
 
-    // 1) próbáljuk localból
     let row = null;
     let db = null;
 
@@ -634,7 +613,6 @@ app.post("/api/request-cancel", async (req, res) => {
       row = null;
     }
 
-    // 2) ha local nincs: Stripe fallback retrieve
     let stripeSub = null;
     try {
       stripeSub = await stripe.subscriptions.retrieve(subscriptionId);
@@ -642,14 +620,12 @@ app.post("/api/request-cancel", async (req, res) => {
       return res.status(404).json({ error: "Unknown subscriptionId (Stripe)" });
     }
 
-    // Email check: ha localban van email, ellenőrizzük; stripe fallbacknél ezt nem tudjuk biztosan
     if (row?.email && email) {
       if (String(email).toLowerCase() !== String(row.email).toLowerCase()) {
         return res.status(403).json({ error: "Email mismatch" });
       }
     }
 
-    // Commitment ellenőrzés: local -> row.commitmentEndsAt, stripe -> metadata.commitmentEndsAt
     const nowSec = Math.floor(Date.now() / 1000);
     const commitmentEndsAt =
       (row && Number(row.commitmentEndsAt || 0)) ||
@@ -662,10 +638,8 @@ app.post("/api/request-cancel", async (req, res) => {
       });
     }
 
-    // Lemondás a periódus végére
     const updated = await stripe.subscriptions.update(subscriptionId, { cancel_at_period_end: true });
 
-    // Local DB frissítés, ha van
     if (db) {
       const safeRow = row || {
         subscriptionId,
@@ -796,7 +770,6 @@ app.post("/api/create-portal-session", async (req, res) => {
 
     let customerId = null;
 
-    // A) Ha van session_id (success oldalról a legjobb)
     if (session_id) {
       const session = await stripe.checkout.sessions.retrieve(String(session_id), {
         expand: ["subscription"],
@@ -807,7 +780,6 @@ app.post("/api/create-portal-session", async (req, res) => {
         (session.customer && session.customer.id) ||
         null;
 
-      // fallback: ha customerId még sincs
       if (!customerId && session.subscription) {
         const subId =
           typeof session.subscription === "string"
@@ -819,20 +791,16 @@ app.post("/api/create-portal-session", async (req, res) => {
       }
     }
 
-    // B) Ha nincs session_id, de van subscriptionId (és/vagy email)
     if (!customerId && subscriptionId) {
-      // 1) próbáljuk a helyi JSON-ból (ha van nálad db)
       try {
         const db = await loadContracts();
         const row = db.bySubscriptionId?.[String(subscriptionId)];
         if (row && row.customerId) customerId = String(row.customerId);
-        // ha email megadva, ellenőrizheted (opcionális)
         if (row && email && row.email && String(email).toLowerCase() !== String(row.email).toLowerCase()) {
           return res.status(403).json({ error: "Email mismatch" });
         }
       } catch (_) {}
 
-      // 2) Stripe fallback: subscription-ből kinyerjük a customer-t
       if (!customerId) {
         const sub = await stripe.subscriptions.retrieve(String(subscriptionId));
         customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id || null;
@@ -849,7 +817,7 @@ app.post("/api/create-portal-session", async (req, res) => {
     const portalSession = await stripe.billingPortal.sessions.create({
       customer: customerId,
       return_url: process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "https://quantumitech.hu/",
-    }); // :contentReference[oaicite:1]{index=1}
+    });
 
     return res.json({ url: portalSession.url });
   } catch (err) {
@@ -861,11 +829,10 @@ app.post("/api/create-portal-session", async (req, res) => {
   }
 });
 
-// -------------------- NEW: MAGIC-LINK PORTAL FLOW --------------------
+// -------------------- MAGIC-LINK PORTAL FLOW --------------------
 // POST /api/portal/magic-request  { email }
 // GET  /api/portal/magic?token=...  -> redirect to portal
 // --------------------
-
 app.post("/api/portal/magic-request", async (req, res) => {
   try {
     const emailRaw = req.body && req.body.email;
@@ -874,19 +841,19 @@ app.post("/api/portal/magic-request", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Invalid email" });
     }
 
-    // Find Stripe customer
     const customer = await findCustomerByEmail(email);
 
-    // Always return generic ok to avoid email enumeration,
-    // but only send email if customer exists.
     if (customer) {
-      // sign token (10 minutes)
       const token = signMagicToken(email, 10 * 60);
-      // Build magic URL - use request host + protocol so Render path works.
-      // If you prefer absolute external URL, set FRONTEND_BASE env and use it.
+
+      // ha akarod fixen a WP domainből menjen, add meg env-ben:
+      // FRONTEND_BASE=https://quantumitech.hu
+      const base = process.env.FRONTEND_BASE;
       const host = req.get("host");
       const proto = req.protocol || "https";
-      const magicUrl = `${proto}://${host}/api/portal/magic?token=${encodeURIComponent(token)}`;
+      const apiBase = base ? base.replace(/\/+$/g, "") : `${proto}://${host}`;
+
+      const magicUrl = `${apiBase}/api/portal/magic?token=${encodeURIComponent(token)}`;
 
       const subject = "Quantum ITech - Belépő link az ügyfélportálhoz";
       const text =
@@ -900,8 +867,14 @@ Ha nem te kérted, hagyd figyelmen kívül ezt az üzenetet.
 Üdv,
 Quantum ITech`;
 
-      // send via configured SMTP (if available)
-      await sendMailSafe({ to: email, subject, text });
+      const html =
+`<p>Szia!</p>
+<p>Kattints a belépéshez (a link 10 percig érvényes):</p>
+<p><a href="${magicUrl}">Belépés</a></p>
+<p>Ha nem te kérted, hagyd figyelmen kívül.</p>
+<p>Üdv,<br/>Quantum ITech</p>`;
+
+      await sendMailSafe({ to: email, subject, text, html });
     }
 
     return res.json({
@@ -921,12 +894,9 @@ app.get("/api/portal/magic", async (req, res) => {
 
     const { email } = verifyMagicToken(token);
 
-    // Find Stripe customer
     const customer = await findCustomerByEmail(email);
     if (!customer) {
-      // Redirect to frontend portal page with error query (or show text)
       const returnUrl = process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "/";
-      // Optionally attach error query
       return res.redirect(`${returnUrl}?portal_error=no_customer`);
     }
 
@@ -940,7 +910,6 @@ app.get("/api/portal/magic", async (req, res) => {
     return res.redirect(302, session.url);
   } catch (e) {
     console.error("magic consume error:", e?.message || e);
-    // Redirect back to portal page with error param to show message
     const returnUrl = process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "/";
     return res.redirect(`${returnUrl}?portal_error=invalid_token`);
   }
