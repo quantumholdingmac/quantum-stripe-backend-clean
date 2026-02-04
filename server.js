@@ -547,55 +547,6 @@ app.get("/api/session-status", async (req, res) => {
   }
 });
 
-// -------------------- subscription-status (LOCAL + STRIPE FALLBACK) --------------------
-app.get("/api/subscription-status", async (req, res) => {
-  try {
-    const subscriptionId = String(req.query.subscriptionId || "").trim();
-    if (!subscriptionId) return res.status(400).json({ error: "Missing subscriptionId" });
-
-    try {
-      const db = await loadContracts();
-      const row = db.bySubscriptionId?.[subscriptionId];
-      if (row) {
-        return res.json({
-          ok: true,
-          source: "local",
-          subscriptionId,
-          email: row.email || "",
-          plan: row.plan || "",
-          planLabel: planLabel(row.plan || ""),
-          termMonths: row.termMonths || null,
-          devicesTotal: row.devicesTotal || null,
-          extraDevices: row.extraDevices || null,
-          commitmentEndsAt: row.commitmentEndsAt || null,
-          cancelAtPeriodEnd: !!row.cancelAtPeriodEnd,
-          status: row.status || "",
-          updatedAt: row.updatedAt || null,
-        });
-      }
-    } catch (_) {}
-
-    const sub = await stripe.subscriptions.retrieve(subscriptionId);
-    return res.json({
-      ok: true,
-      source: "stripe",
-      subscriptionId: sub.id,
-      email: null,
-      plan: sub.metadata?.plan || "",
-      planLabel: planLabel(sub.metadata?.plan || ""),
-      termMonths: sub.metadata?.termMonths ? Number(sub.metadata.termMonths) : null,
-      devicesTotal: sub.metadata?.devicesTotal ? Number(sub.metadata.devicesTotal) : null,
-      extraDevices: sub.metadata?.extraDevices ? Number(sub.metadata.extraDevices) : null,
-      commitmentEndsAt: sub.metadata?.commitmentEndsAt ? Number(sub.metadata.commitmentEndsAt) : null,
-      cancelAtPeriodEnd: !!sub.cancel_at_period_end,
-      status: sub.status,
-      updatedAt: null,
-    });
-  } catch (err) {
-    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
-  }
-});
-
 // -------------------- CANCEL REQUEST (LOCAL + STRIPE FALLBACK) --------------------
 app.post("/api/request-cancel", async (req, res) => {
   try {
@@ -690,78 +641,6 @@ app.post("/api/request-cancel", async (req, res) => {
     return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
   }
 });
-// ---------- Customer Portal session (Stripe Customer Portal) ----------
-app.post("/api/create-portal-session", async (req, res) => {
-  try {
-    const { session_id, subscriptionId, email } = req.body || {};
-
-    let customerId = null;
-
-    // A) Ha van session_id (success oldalról a legjobb)
-    if (session_id) {
-      const session = await stripe.checkout.sessions.retrieve(String(session_id), {
-        expand: ["subscription"],
-      });
-
-      customerId =
-        (typeof session.customer === "string" && session.customer) ||
-        (session.customer && session.customer.id) ||
-        null;
-
-      // fallback: ha customerId még sincs
-      if (!customerId && session.subscription) {
-        const subId =
-          typeof session.subscription === "string"
-            ? session.subscription
-            : session.subscription.id;
-
-        const sub = await stripe.subscriptions.retrieve(subId);
-        customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id || null;
-      }
-    }
-
-    // B) Ha nincs session_id, de van subscriptionId (és/vagy email)
-    if (!customerId && subscriptionId) {
-      // 1) próbáljuk a helyi JSON-ból (ha van nálad db)
-      try {
-        const db = await loadContracts();
-        const row = db.bySubscriptionId?.[String(subscriptionId)];
-        if (row && row.customerId) customerId = String(row.customerId);
-        // ha email megadva, ellenőrizheted (opcionális)
-        if (row && email && row.email && String(email).toLowerCase() !== String(row.email).toLowerCase()) {
-          return res.status(403).json({ error: "Email mismatch" });
-        }
-      } catch (_) {}
-
-      // 2) Stripe fallback: subscription-ből kinyerjük a customer-t
-      if (!customerId) {
-        const sub = await stripe.subscriptions.retrieve(String(subscriptionId));
-        customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id || null;
-      }
-    }
-
-    if (!customerId) {
-      return res.status(400).json({
-        error: "Missing customer",
-        details: "Adj meg session_id-t vagy subscriptionId-t.",
-      });
-    }
-
-    const portalSession = await stripe.billingPortal.sessions.create({
-      customer: customerId,
-      return_url: process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "https://quantumitech.hu/",
-    }); // :contentReference[oaicite:1]{index=1}
-
-    return res.json({ url: portalSession.url });
-  } catch (err) {
-    console.error("create-portal-session error:", err);
-    return res.status(500).json({
-      error: "Server error",
-      details: err?.message || String(err),
-    });
-  }
-});
-
 
 // ---------- Customer Portal session (Stripe Customer Portal) ----------
 app.post("/api/create-portal-session", async (req, res) => {
@@ -831,7 +710,7 @@ app.post("/api/create-portal-session", async (req, res) => {
 
 // -------------------- MAGIC-LINK PORTAL FLOW --------------------
 // POST /api/portal/magic-request  { email }
-// GET  /api/portal/magic?token=...  -> redirect to portal
+// GET  /api/portal/magic?token=...  -> redirect to stripe portal
 // --------------------
 app.post("/api/portal/magic-request", async (req, res) => {
   try {
@@ -843,18 +722,17 @@ app.post("/api/portal/magic-request", async (req, res) => {
 
     const customer = await findCustomerByEmail(email);
 
+    // mindig ugyanazt válaszoljuk (ne lehessen emailt "kitalálni")
     if (customer) {
       const token = signMagicToken(email, 10 * 60);
 
-      // ha akarod fixen a WP domainből menjen, add meg env-ben:
-      // FRONTEND_BASE=https://quantumitech.hu
-    
-      
-      const apiBase = base ? base.replace(/\/+$/g, "") : `${proto}://${host}`;
-    const base = (process.env.FRONTEND_BASE || "").replace(/\/+$/, "");
-    const magicUrl = `${base}/api/portal/magic?token=${encodeURIComponent(token)}`;
+      // Fix domainhez: FRONTEND_BASE = https://quantumitech.hu
+      // Ha nincs megadva, fallback: a render hostot használja.
+      const fallbackBase = `${req.protocol}://${req.get("host")}`;
+      const base = (process.env.FRONTEND_BASE || fallbackBase).replace(/\/+$/g, "");
 
-      
+      const magicUrl = `${base}/api/portal/magic?token=${encodeURIComponent(token)}`;
+
       const subject = "Quantum ITech - Belépő link az ügyfélportálhoz";
       const text =
 `Szia!
@@ -904,7 +782,7 @@ app.get("/api/portal/magic", async (req, res) => {
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customer.id,
-      return_url: returnUrl
+      return_url: returnUrl,
     });
 
     return res.redirect(302, session.url);
