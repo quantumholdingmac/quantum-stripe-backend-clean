@@ -61,6 +61,127 @@ app.use(
   })
 );
 
+// ======================================================================
+// ========================== DOCUSIGN HELPERS ===========================
+// ======================================================================
+
+function stripQuotes(s) {
+  s = String(s || "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
+  }
+  return s.trim();
+}
+
+function normalizePemNewlines(pem) {
+  pem = String(pem || "");
+  // Render néha \\n-ként tárolja
+  if (pem.includes("\\n")) pem = pem.replace(/\\n/g, "\n");
+  // CRLF -> LF
+  pem = pem.replace(/\r\n/g, "\n");
+  return pem.trim();
+}
+
+/**
+ * A lényeg: DOCUSIGN_PRIVATE_KEY_B64 (ajánlott) -> PEM string
+ * Fallback: DOCUSIGN_PRIVATE_KEY vagy DOCUSIGN_PRIVATE_KEY_PEM -> PEM string
+ */
+function getDocuSignPrivateKeyPem() {
+  // 1) Ajánlott: base64 env
+  const b64raw = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64 || "");
+  if (b64raw) {
+    // base64 lehet több soros / whitespace-es -> takarítsuk
+    const b64 = b64raw.replace(/\s+/g, "");
+    const decoded = Buffer.from(b64, "base64").toString("utf8");
+    const pem = normalizePemNewlines(decoded);
+
+    const looksLikePem =
+      pem.includes("BEGIN RSA PRIVATE KEY") || pem.includes("BEGIN PRIVATE KEY");
+
+    if (!looksLikePem) {
+      throw new Error(
+        "DOCUSIGN_PRIVATE_KEY_B64 decoded, but it does not look like a PEM private key (BEGIN ... PRIVATE KEY)"
+      );
+    }
+    return pem;
+  }
+
+  // 2) Fallback: sima PEM env
+  const pemRaw =
+    stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_PEM) ||
+    stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY) ||
+    "";
+
+  const pem = normalizePemNewlines(pemRaw);
+
+  const looksLikePem =
+    pem.includes("BEGIN RSA PRIVATE KEY") || pem.includes("BEGIN PRIVATE KEY");
+
+  if (!pem) return "";
+  if (!looksLikePem) {
+    throw new Error(
+      "DOCUSIGN_PRIVATE_KEY(_PEM) is set, but it does not look like a PEM private key (BEGIN ... PRIVATE KEY)"
+    );
+  }
+
+  return pem;
+}
+
+function getDocuSignConfig() {
+  const integrationKey = stripQuotes(process.env.DOCUSIGN_INTEGRATION_KEY); // client_id
+  const userId = stripQuotes(process.env.DOCUSIGN_USER_ID);
+  const accountId = stripQuotes(process.env.DOCUSIGN_ACCOUNT_ID);
+  const basePath =
+    stripQuotes(process.env.DOCUSIGN_BASE_PATH) || "https://demo.docusign.net/restapi";
+  const oAuthBasePath =
+    stripQuotes(process.env.DOCUSIGN_OAUTH_BASE_PATH) || "account-d.docusign.com";
+  const templateId = stripQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
+
+  const privateKeyPem = getDocuSignPrivateKeyPem();
+
+  if (!integrationKey || !userId || !accountId || !templateId) {
+    throw new Error(
+      "Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)"
+    );
+  }
+  if (!privateKeyPem) {
+    throw new Error(
+      "DOCUSIGN private key is missing (use DOCUSIGN_PRIVATE_KEY_B64 recommended)"
+    );
+  }
+
+  return {
+    integrationKey,
+    userId,
+    accountId,
+    basePath,
+    oAuthBasePath,
+    templateId,
+    privateKeyPem, // <-- STRING! (ne Buffer)
+  };
+}
+
+async function getDocusignApiClient() {
+  const cfg = getDocuSignConfig();
+  const apiClient = new docusign.ApiClient();
+  apiClient.setBasePath(cfg.basePath);
+  apiClient.setOAuthBasePath(cfg.oAuthBasePath);
+
+  // JWT token (RS256) -> privateKey PEM STRING kell
+  const results = await apiClient.requestJWTUserToken(
+    cfg.integrationKey,
+    cfg.userId,
+    ["signature", "impersonation"],
+    cfg.privateKeyPem,
+    3600
+  );
+
+  const accessToken = results.body.access_token;
+  apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
+
+  return { apiClient, cfg };
+}
+
 // -------------------- BODY PARSER --------------------
 // Webhook RAW kell, ezért JSON parserből kivesszük:
 app.use((req, res, next) => {
@@ -151,7 +272,9 @@ function normalizeEmail(email) {
 }
 
 function b64urlEncode(bufOrStr) {
-  const buf = Buffer.isBuffer(bufOrStr) ? bufOrStr : Buffer.from(String(bufOrStr), "utf8");
+  const buf = Buffer.isBuffer(bufOrStr)
+    ? bufOrStr
+    : Buffer.from(String(bufOrStr), "utf8");
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 function b64urlDecode(str) {
@@ -205,105 +328,6 @@ async function findCustomerByEmail(email) {
   return res.data && res.data.length ? res.data[0] : null;
 }
 
-// ======================================================================
-// ========================== DOCUSIGN HELPERS ===========================
-// ======================================================================
-
-// Ez a lényeg: ha Renderben base64-ként tárolod a privát kulcsot, itt PEM-mé alakítjuk.
-function getDocuSignPrivateKeyPem() {
-  // 1) Ajánlott: base64 env
-  const b64 = process.env.DOCUSIGN_PRIVATE_KEY_B64;
-  if (b64 && String(b64).trim()) {
-    const pem = Buffer.from(String(b64).trim(), "base64").toString("utf8");
-    if (!pem.includes("BEGIN") || !pem.includes("PRIVATE KEY")) {
-      throw new Error("DOCUSIGN_PRIVATE_KEY_B64 decoded, but it does not look like a PEM private key");
-    }
-    return pem;
-  }
-
-  // 2) Fallback: sima PEM env (néha \\n-ekkel)
-  let raw =
-    process.env.DOCUSIGN_PRIVATE_KEY_PEM ||
-    process.env.DOCUSIGN_PRIVATE_KEY ||
-    "";
-
-  raw = String(raw);
-  if (raw.includes("\\n")) raw = raw.replace(/\\n/g, "\n");
-
-  if (!raw.trim()) return "";
-  if (!raw.includes("BEGIN") || !raw.includes("PRIVATE KEY")) {
-    throw new Error("DOCUSIGN_PRIVATE_KEY(_PEM) is set, but it does not look like a PEM private key");
-  }
-
-  return raw;
-}
-
-function stripQuotes(s) {
-  s = String(s || "").trim();
-  // ha véletlenül idézőjellel kerül be: "...."
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1, -1);
-  }
-  return s.trim();
-}
-
-function getDocuSignConfig() {
-  const integrationKey = stripQuotes(process.env.DOCUSIGN_INTEGRATION_KEY);
-  const userId = stripQuotes(process.env.DOCUSIGN_USER_ID);
-  const accountId = stripQuotes(process.env.DOCUSIGN_ACCOUNT_ID);
-  const basePath = stripQuotes(process.env.DOCUSIGN_BASE_PATH) || "https://demo.docusign.net/restapi";
-  const oAuthBasePath = stripQuotes(process.env.DOCUSIGN_OAUTH_BASE_PATH) || "account-d.docusign.com";
-  const templateId = stripQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
-
-  const b64 = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64);
-  let pem = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY); // ha valaki PEM-ben adná
-
-  if (!pem && b64) {
-    pem = Buffer.from(b64, "base64").toString("utf8");
-  }
-
-  // ha \n literálisan van benne
-  pem = String(pem || "").replace(/\\n/g, "\n").trim();
-
-  const looksLikePem =
-    pem.includes("BEGIN RSA PRIVATE KEY") || pem.includes("BEGIN PRIVATE KEY");
-
-  if (!integrationKey || !userId || !accountId || !templateId) {
-    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)");
-  }
-  if (!pem || !looksLikePem) {
-    throw new Error("DOCUSIGN private key is missing or not PEM after decoding (check DOCUSIGN_PRIVATE_KEY_B64 / DOCUSIGN_PRIVATE_KEY)");
-  }
-
-  // ✅ itt a kulcsot Bufferként adjuk tovább
-  const privateKey = Buffer.from(pem, "utf8");
-
-  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKey };
-}
-
-
-async function getDocusignApiClient() {
-  const cfg = getDocuSignConfig();
-  const apiClient = new docusign.ApiClient();
-  apiClient.setBasePath(cfg.basePath);
-  apiClient.setOAuthBasePath(cfg.oAuthBasePath);
-
-  const results = await apiClient.requestJWTUserToken(
-  cfg.integrationKey,
-  cfg.userId,
-  ["signature", "impersonation"],
-  cfg.privateKey,   // ✅ Buffer
-  3600
-);
-
-
-  const accessToken = results.body.access_token;
-  apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
-
-  return { apiClient, cfg };
-}
-
-
 // -------------------- ADMIN AUTH --------------------
 function requireAdmin(req, res, next) {
   const token =
@@ -319,8 +343,6 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
-
-
 // -------------------- HEALTH --------------------
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "quantum-stripe-backend", dataDir: DATA_DIR });
@@ -332,6 +354,25 @@ app.get("/", (req, res) => {
 
 app.get("/api/docusign/ping", (req, res) => {
   return res.json({ ok: true, service: "docusign", time: new Date().toISOString() });
+});
+
+// DEBUG: nézd meg mit lát a backend kulcsnak (nem logoljuk ki a kulcsot!)
+app.get("/api/docusign/debug-key", (req, res) => {
+  try {
+    const cfg = getDocuSignConfig();
+    const pem = cfg.privateKeyPem;
+    const firstLine = (pem.split("\n")[0] || "").trim();
+    return res.json({
+      ok: true,
+      firstLine,
+      length: pem.length,
+      hasBegin: pem.includes("BEGIN"),
+      hasPrivateKey: pem.includes("PRIVATE KEY"),
+      hasRSA: pem.includes("RSA PRIVATE KEY"),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
 });
 
 // Egyszerű “start” endpoint (ahogy eddig használtad curl-lel)
@@ -367,10 +408,8 @@ app.post("/api/docusign/start", async (req, res) => {
 
     const envelopesApi = new docusign.EnvelopesApi(apiClient);
 
-    // Embedded signing-hoz kell egy clientUserId (stabil string)
     const clientUserId = String(contractId || "customer-" + Date.now());
 
-    // Template mezők kitöltése tabLabel alapján
     const textTabs = [
       { tabLabel: "customer_name", value: String(customer_name) },
       { tabLabel: "customer_email", value: String(customer_email) },
@@ -388,9 +427,6 @@ app.post("/api/docusign/start", async (req, res) => {
       { tabLabel: "extra_device_price", value: String(extra_device_price || "") },
       { tabLabel: "setup_fee", value: String(setup_fee || "") },
       { tabLabel: "monthly_total", value: String(monthly_total || "") },
-
-      // ha van ilyen tabLabel a template-ben:
-      // { tabLabel: "sum_period", value: String(term_months || "") },
     ];
 
     const envelopeDefinition = new docusign.EnvelopeDefinition();
@@ -399,10 +435,10 @@ app.post("/api/docusign/start", async (req, res) => {
 
     envelopeDefinition.templateRoles = [
       {
-        roleName: "Customer", // egyezzen a template role-lal
+        roleName: "Customer",
         name: String(customer_name),
         email: String(customer_email),
-        clientUserId, // ettől lesz embedded
+        clientUserId,
         tabs: { textTabs },
       },
     ];
@@ -416,7 +452,9 @@ app.post("/api/docusign/start", async (req, res) => {
     const baseReturn = process.env.DOCUSIGN_RETURN_URL || "https://quantumitech.hu/ugyfel";
     const returnUrl =
       baseReturn +
-      `?docusign=return&envelopeId=${encodeURIComponent(envelopeId)}&contractId=${encodeURIComponent(clientUserId)}`;
+      `?docusign=return&envelopeId=${encodeURIComponent(envelopeId)}&contractId=${encodeURIComponent(
+        clientUserId
+      )}`;
 
     const viewRequest = new docusign.RecipientViewRequest();
     viewRequest.returnUrl = returnUrl;
@@ -424,8 +462,6 @@ app.post("/api/docusign/start", async (req, res) => {
     viewRequest.email = String(customer_email);
     viewRequest.userName = String(customer_name);
     viewRequest.clientUserId = clientUserId;
-
-    // Template-nél sokszor jó a "1", ha nem, akkor recipients listából kell lekérni.
     viewRequest.recipientId = "1";
 
     const viewResult = await envelopesApi.createRecipientView(cfg.accountId, envelopeId, {
@@ -935,9 +971,15 @@ app.post("/api/request-cancel", async (req, res) => {
         subscriptionId,
         email: row?.email || "",
         plan: row?.plan || stripeSub?.metadata?.plan || "",
-        termMonths: row?.termMonths || (stripeSub?.metadata?.termMonths ? Number(stripeSub.metadata.termMonths) : null),
-        devicesTotal: row?.devicesTotal || (stripeSub?.metadata?.devicesTotal ? Number(stripeSub.metadata.devicesTotal) : null),
-        extraDevices: row?.extraDevices || (stripeSub?.metadata?.extraDevices ? Number(stripeSub.metadata.extraDevices) : null),
+        termMonths:
+          row?.termMonths ||
+          (stripeSub?.metadata?.termMonths ? Number(stripeSub.metadata.termMonths) : null),
+        devicesTotal:
+          row?.devicesTotal ||
+          (stripeSub?.metadata?.devicesTotal ? Number(stripeSub.metadata.devicesTotal) : null),
+        extraDevices:
+          row?.extraDevices ||
+          (stripeSub?.metadata?.extraDevices ? Number(stripeSub.metadata.extraDevices) : null),
         commitmentEndsAt: commitmentEndsAt || null,
         status: updated.status,
       };
@@ -1046,28 +1088,6 @@ app.post("/api/create-portal-session", async (req, res) => {
     });
   }
 });
-
-app.get("/api/docusign/debug-key", (req, res) => {
-  try {
-    const cfg = getDocuSignConfig();
-
-    // cfg.privateKey Buffer -> string a vizsgálathoz
-    const pem = cfg.privateKey.toString("utf8");
-    const firstLine = pem.split("\n")[0] || "";
-
-    return res.json({
-      ok: true,
-      firstLine,
-      length: pem.length,
-      hasBegin: pem.includes("BEGIN"),
-      hasPrivateKey: pem.includes("PRIVATE KEY"),
-      hasRSA: pem.includes("RSA PRIVATE KEY"),
-    });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message || String(e) });
-  }
-});
-
 
 // -------------------- MAGIC-LINK PORTAL FLOW --------------------
 app.post("/api/portal/magic-request", async (req, res) => {
