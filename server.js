@@ -163,16 +163,27 @@ function getDocuSignConfig() {
 
 async function getDocusignApiClient() {
   const cfg = getDocuSignConfig();
+
   const apiClient = new docusign.ApiClient();
   apiClient.setBasePath(cfg.basePath);
   apiClient.setOAuthBasePath(cfg.oAuthBasePath);
 
-  // JWT token (RS256) -> privateKey PEM STRING kell
+  // ✅ A LÉNYEG: PEM -> KeyObject (így RS256 biztosan "asymmetric key"-nek látja)
+  let keyObject;
+  try {
+    keyObject = crypto.createPrivateKey({
+      key: cfg.privateKeyPem,
+      format: "pem",
+    });
+  } catch (e) {
+    throw new Error("Invalid DOCUSIGN private key PEM (crypto.createPrivateKey failed): " + (e?.message || e));
+  }
+
   const results = await apiClient.requestJWTUserToken(
     cfg.integrationKey,
     cfg.userId,
     ["signature", "impersonation"],
-    cfg.privateKeyPem,
+    keyObject, // ✅ KeyObject, nem string
     3600
   );
 
@@ -181,6 +192,7 @@ async function getDocusignApiClient() {
 
   return { apiClient, cfg };
 }
+
 
 // -------------------- BODY PARSER --------------------
 // Webhook RAW kell, ezért JSON parserből kivesszük:
@@ -362,6 +374,19 @@ app.get("/api/docusign/debug-key", (req, res) => {
     const cfg = getDocuSignConfig();
     const pem = cfg.privateKeyPem;
     const firstLine = (pem.split("\n")[0] || "").trim();
+
+    let keyInfo = {};
+    try {
+      const keyObj = crypto.createPrivateKey({ key: pem, format: "pem" });
+      keyInfo = {
+        isKeyObject: !!keyObj,
+        type: keyObj.type, // "private"
+        asymmetricKeyType: keyObj.asymmetricKeyType, // "rsa"
+      };
+    } catch (e) {
+      keyInfo = { keyObjectError: e?.message || String(e) };
+    }
+
     return res.json({
       ok: true,
       firstLine,
@@ -369,11 +394,13 @@ app.get("/api/docusign/debug-key", (req, res) => {
       hasBegin: pem.includes("BEGIN"),
       hasPrivateKey: pem.includes("PRIVATE KEY"),
       hasRSA: pem.includes("RSA PRIVATE KEY"),
+      keyInfo,
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
+
 
 // Egyszerű “start” endpoint (ahogy eddig használtad curl-lel)
 app.post("/api/docusign/start", async (req, res) => {
