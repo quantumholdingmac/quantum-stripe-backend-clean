@@ -127,71 +127,87 @@ function getDocuSignPrivateKeyPem() {
   return pem;
 }
 
+function stripQuotes(s) {
+  s = String(s || "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
+  }
+  return s.trim();
+}
+
 function getDocuSignConfig() {
   const integrationKey = stripQuotes(process.env.DOCUSIGN_INTEGRATION_KEY);
   const userId = stripQuotes(process.env.DOCUSIGN_USER_ID);
   const accountId = stripQuotes(process.env.DOCUSIGN_ACCOUNT_ID);
+  const templateId = stripQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
+
   const basePath =
     stripQuotes(process.env.DOCUSIGN_BASE_PATH) || "https://demo.docusign.net/restapi";
   const oAuthBasePath =
     stripQuotes(process.env.DOCUSIGN_OAUTH_BASE_PATH) || "account-d.docusign.com";
-  const templateId = stripQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
 
+  // 1) elsődlegesen B64
   const b64 = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64);
-  if (!b64) {
-    throw new Error("Missing DOCUSIGN_PRIVATE_KEY_B64");
+  let pem = "";
+
+  if (b64) {
+    pem = Buffer.from(b64, "base64").toString("utf8");
+  } else {
+    // 2) fallback PEM env (ha valaki így adná meg)
+    pem = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_PEM || process.env.DOCUSIGN_PRIVATE_KEY || "");
+    if (pem.includes("\\n")) pem = pem.replace(/\\n/g, "\n");
   }
 
-  const pem = Buffer.from(b64, "base64")
-    .toString("utf8")
-    .replace(/\r\n/g, "\n")
-    .trim();
-
-  const looksLikePem = pem.includes("BEGIN PRIVATE KEY") || pem.includes("BEGIN RSA PRIVATE KEY");
-  if (!looksLikePem) {
-    throw new Error("Decoded key is not PEM private key");
-  }
+  pem = String(pem || "").replace(/\r\n/g, "\n").trim();
 
   if (!integrationKey || !userId || !accountId || !templateId) {
     throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)");
   }
 
-  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKey: pem };
-}
+  if (!pem) {
+    throw new Error("Missing DOCUSIGN private key (set DOCUSIGN_PRIVATE_KEY_B64 on Render)");
+  }
 
+  // Validálás OpenSSL/Node crypto-val:
+  try {
+    crypto.createPrivateKey(pem);
+  } catch (e) {
+    throw new Error(
+      "Invalid DOCUSIGN private key PEM (crypto.createPrivateKey failed): " + (e?.message || e)
+    );
+  }
+
+  return {
+    integrationKey,
+    userId,
+    accountId,
+    basePath,
+    oAuthBasePath,
+    templateId,
+    privateKeyPem: pem, // STRING!
+  };
+}
 
 async function getDocusignApiClient() {
   const cfg = getDocuSignConfig();
-
   const apiClient = new docusign.ApiClient();
   apiClient.setBasePath(cfg.basePath);
   apiClient.setOAuthBasePath(cfg.oAuthBasePath);
 
-  // ✅ A LÉNYEG: PEM -> KeyObject (így RS256 biztosan "asymmetric key"-nek látja)
-  let keyObject;
-  try {
-    keyObject = crypto.createPrivateKey({
-      key: cfg.privateKeyPem,
-      format: "pem",
-    });
-  } catch (e) {
-    throw new Error("Invalid DOCUSIGN private key PEM (crypto.createPrivateKey failed): " + (e?.message || e));
-  }
-
   const results = await apiClient.requestJWTUserToken(
-  cfg.integrationKey,
-  cfg.userId,
-  ["signature", "impersonation"],
-  cfg.privateKey, // STRING PEM
-  3600
-);
-
+    cfg.integrationKey,
+    cfg.userId,
+    ["signature", "impersonation"],
+    cfg.privateKeyPem, // STRING PEM
+    3600
+  );
 
   const accessToken = results.body.access_token;
   apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
 
   return { apiClient, cfg };
 }
+
 
 
 // -------------------- BODY PARSER --------------------
