@@ -240,50 +240,43 @@ function getDocuSignPrivateKeyPem() {
 
 function getDocuSignConfig() {
   const integrationKey = process.env.DOCUSIGN_INTEGRATION_KEY; // client_id
-  const userId = process.env.DOCUSIGN_USER_ID;                 // Felhasználói azonosító
-  const accountId = process.env.DOCUSIGN_ACCOUNT_ID;           // API-fiók azonosítója
+  const userId = process.env.DOCUSIGN_USER_ID;                 // User GUID
+  const accountId = process.env.DOCUSIGN_ACCOUNT_ID;           // API Account ID
   const basePath = process.env.DOCUSIGN_BASE_PATH || "https://demo.docusign.net/restapi";
   const oAuthBasePath = process.env.DOCUSIGN_OAUTH_BASE_PATH || "account-d.docusign.com";
   const templateId = process.env.DOCUSIGN_TEMPLATE_ID;
 
-  // 1) Preferált: külön B64 env
-  const b64 = process.env.DOCUSIGN_PRIVATE_KEY_B64 || "";
+  // ✅ támogatjuk mindkét formát:
+  // - DOCUSIGN_PRIVATE_KEY_B64 (base64)
+  // - DOCUSIGN_PRIVATE_KEY (közvetlen PEM)
+  const privateKeyB64 = (process.env.DOCUSIGN_PRIVATE_KEY_B64 || "").trim();
+  let privateKeyPem = (process.env.DOCUSIGN_PRIVATE_KEY || "").trim();
 
-  // 2) Fallback: ha valaki véletlenül a DOCUSIGN_PRIVATE_KEY-be tett B64-et
-  const maybePemOrB64 = process.env.DOCUSIGN_PRIVATE_KEY || "";
-
-  let privateKey = "";
-
-  if (b64) {
-    privateKey = Buffer.from(b64.trim(), "base64").toString("utf8");
-  } else if (maybePemOrB64.trim().startsWith("LS0tLS1CRUdJTi")) {
-    // "-----BEGIN" base64-ben gyakran ezzel kezdődik
-    privateKey = Buffer.from(maybePemOrB64.trim(), "base64").toString("utf8");
-  } else {
-    privateKey = maybePemOrB64;
+  if (!privateKeyPem && privateKeyB64) {
+    // ha base64-ben van, dekódoljuk PEM-re
+    privateKeyPem = Buffer.from(privateKeyB64, "base64").toString("utf8").trim();
   }
 
-  // ha \n stringként van eltárolva, alakítsuk vissza
-  privateKey = String(privateKey || "").replace(/\\n/g, "\n").trim();
+  // ha valamiért \n literálisan van benne
+  privateKeyPem = privateKeyPem.replace(/\\n/g, "\n").trim();
 
-  if (!integrationKey || !userId || !accountId || !privateKey || !templateId) {
-    throw new Error(
-      "Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, PRIVATE_KEY(_B64), TEMPLATE_ID)"
-    );
+  // ✅ gyors validáció (nem szivárogtat kulcsot)
+  const looksLikePem =
+    privateKeyPem.includes("BEGIN RSA PRIVATE KEY") ||
+    privateKeyPem.includes("BEGIN PRIVATE KEY");
+
+  if (!integrationKey || !userId || !accountId || !templateId || !privateKeyPem) {
+    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, PRIVATE_KEY(_B64), TEMPLATE_ID)");
+  }
+  if (!looksLikePem) {
+    throw new Error("DOCUSIGN private key is not PEM format after decoding (missing BEGIN ... PRIVATE KEY header)");
   }
 
-  // extra sanity: nézzük meg, PEM-e
-  if (!privateKey.includes("BEGIN") || !privateKey.includes("PRIVATE KEY")) {
-    throw new Error("DOCUSIGN private key is not PEM after decoding");
-  }
-
-  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKey };
+  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKeyPem };
 }
-
 
 async function getDocusignApiClient() {
   const cfg = getDocuSignConfig();
-
   const apiClient = new docusign.ApiClient();
   apiClient.setBasePath(cfg.basePath);
   apiClient.setOAuthBasePath(cfg.oAuthBasePath);
@@ -292,7 +285,7 @@ async function getDocusignApiClient() {
     cfg.integrationKey,
     cfg.userId,
     ["signature", "impersonation"],
-    cfg.privateKey,
+    cfg.privateKeyPem, // ✅ itt már PEM megy be
     3600
   );
 
@@ -301,6 +294,7 @@ async function getDocusignApiClient() {
 
   return { apiClient, cfg };
 }
+
 
 // -------------------- ADMIN AUTH --------------------
 function requireAdmin(req, res, next) {
