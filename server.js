@@ -225,6 +225,17 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "quantum-stripe-backend", dataDir: DATA_DIR });
 });
 
+// -------------------- DOCUSIGN TEST ROUTES --------------------
+app.get("/api/docusign/ping", (req, res) => {
+  return res.json({ ok: true, service: "docusign", time: new Date().toISOString() });
+});
+
+app.get("/api/docusign/test-sign", (req, res) => {
+  // Ez csak teszt endpoint, hogy lássuk elérhető-e
+  return res.json({ ok: true, next: "implement embedded signing flow here" });
+});
+
+
 // -------------------- CHECKOUT SESSION --------------------
 app.post("/api/create-checkout-session", async (req, res) => {
   try {
