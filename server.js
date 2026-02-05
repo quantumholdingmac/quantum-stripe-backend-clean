@@ -25,14 +25,7 @@ async function sendMailSafe({ to, subject, text, html }) {
 
     const from = process.env.MAIL_FROM || "Quantum ITech <info@quantumitech.hu>";
 
-    await resend.emails.send({
-      from,
-      to,
-      subject,
-      text,
-      html,
-    });
-
+    await resend.emails.send({ from, to, subject, text, html });
     console.log("MAIL: sent via Resend to", to);
   } catch (e) {
     console.error("MAIL: failed:", e?.message || e);
@@ -48,180 +41,15 @@ const corsOrigins = (process.env.CORS_ORIGINS || "")
 app.use(
   cors({
     origin: function (origin, cb) {
-      // origin nélküli requestek (Stripe webhook, curl) -> ok
       if (!origin) return cb(null, true);
-
       if (!corsOrigins.length) return cb(null, true);
       if (corsOrigins.includes(origin)) return cb(null, true);
-
       return cb(new Error("Not allowed by CORS: " + origin));
     },
     methods: ["POST", "GET"],
     credentials: true,
   })
 );
-
-// ======================================================================
-// ========================== DOCUSIGN HELPERS ===========================
-// ======================================================================
-
-function stripQuotes(s) {
-  s = String(s || "").trim();
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1, -1);
-  }
-  return s.trim();
-}
-
-function normalizePemNewlines(pem) {
-  pem = String(pem || "");
-  // Render néha \\n-ként tárolja
-  if (pem.includes("\\n")) pem = pem.replace(/\\n/g, "\n");
-  // CRLF -> LF
-  pem = pem.replace(/\r\n/g, "\n");
-  return pem.trim();
-}
-
-/**
- * A lényeg: DOCUSIGN_PRIVATE_KEY_B64 (ajánlott) -> PEM string
- * Fallback: DOCUSIGN_PRIVATE_KEY vagy DOCUSIGN_PRIVATE_KEY_PEM -> PEM string
- */
-function getDocuSignPrivateKeyPem() {
-  // 1) Ajánlott: base64 env
-  const b64raw = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64 || "");
-  if (b64raw) {
-    // base64 lehet több soros / whitespace-es -> takarítsuk
-    const b64 = b64raw.replace(/\s+/g, "");
-    const decoded = Buffer.from(b64, "base64").toString("utf8");
-    const pem = normalizePemNewlines(decoded);
-
-    const looksLikePem =
-      pem.includes("BEGIN RSA PRIVATE KEY") || pem.includes("BEGIN PRIVATE KEY");
-
-    if (!looksLikePem) {
-      throw new Error(
-        "DOCUSIGN_PRIVATE_KEY_B64 decoded, but it does not look like a PEM private key (BEGIN ... PRIVATE KEY)"
-      );
-    }
-    return pem;
-  }
-
-  // 2) Fallback: sima PEM env
-  const pemRaw =
-    stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_PEM) ||
-    stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY) ||
-    "";
-
-  const pem = normalizePemNewlines(pemRaw);
-
-  const looksLikePem =
-    pem.includes("BEGIN RSA PRIVATE KEY") || pem.includes("BEGIN PRIVATE KEY");
-
-  if (!pem) return "";
-  if (!looksLikePem) {
-    throw new Error(
-      "DOCUSIGN_PRIVATE_KEY(_PEM) is set, but it does not look like a PEM private key (BEGIN ... PRIVATE KEY)"
-    );
-  }
-
-  return pem;
-}
-
-function stripQuotes(s) {
-  s = String(s || "").trim();
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1, -1);
-  }
-  return s.trim();
-}
-
-function getDocuSignConfig() {
-  const integrationKey = stripQuotes(process.env.DOCUSIGN_INTEGRATION_KEY);
-  const userId = stripQuotes(process.env.DOCUSIGN_USER_ID);
-  const accountId = stripQuotes(process.env.DOCUSIGN_ACCOUNT_ID);
-  const templateId = stripQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
-
-  const basePath =
-    stripQuotes(process.env.DOCUSIGN_BASE_PATH) || "https://demo.docusign.net/restapi";
-  const oAuthBasePath =
-    stripQuotes(process.env.DOCUSIGN_OAUTH_BASE_PATH) || "account-d.docusign.com";
-
-  // 1) elsődlegesen B64
-  const b64 = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64);
-  let pem = "";
-
-  if (b64) {
-    pem = Buffer.from(b64, "base64").toString("utf8");
-  } else {
-    // 2) fallback PEM env (ha valaki így adná meg)
-    pem = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_PEM || process.env.DOCUSIGN_PRIVATE_KEY || "");
-    if (pem.includes("\\n")) pem = pem.replace(/\\n/g, "\n");
-  }
-
-  pem = String(pem || "").replace(/\r\n/g, "\n").trim();
-
-  if (!integrationKey || !userId || !accountId || !templateId) {
-    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)");
-  }
-
-  if (!pem) {
-    throw new Error("Missing DOCUSIGN private key (set DOCUSIGN_PRIVATE_KEY_B64 on Render)");
-  }
-
-  // Validálás OpenSSL/Node crypto-val:
-  try {
-    crypto.createPrivateKey(pem);
-  } catch (e) {
-    throw new Error(
-      "Invalid DOCUSIGN private key PEM (crypto.createPrivateKey failed): " + (e?.message || e)
-    );
-  }
-
-  return {
-    integrationKey,
-    userId,
-    accountId,
-    basePath,
-    oAuthBasePath,
-    templateId,
-    privateKeyPem: pem, // STRING!
-  };
-}
-
-async function getDocusignApiClient() {
-  const cfg = getDocuSignConfig();
-  const apiClient = new docusign.ApiClient();
-  apiClient.setBasePath(cfg.basePath);
-  apiClient.setOAuthBasePath(cfg.oAuthBasePath);
-
-  let results;
-  try {
-    results = await apiClient.requestJWTUserToken(
-      cfg.integrationKey,
-      cfg.userId,
-      ["signature", "impersonation"],
-      cfg.privateKey,
-      3600
-    );
-  } catch (err) {
-    console.error("DOCUSIGN JWT error:", {
-      message: err?.message,
-      status: err?.response?.status,
-      body: err?.response?.body,
-      text: err?.response?.text,
-      data: err?.response?.data,
-    });
-    throw err;
-  }
-
-  const accessToken = results.body.access_token;
-  apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
-
-  return { apiClient, cfg };
-}
-
-
-
 
 // -------------------- BODY PARSER --------------------
 // Webhook RAW kell, ezért JSON parserből kivesszük:
@@ -232,17 +60,14 @@ app.use((req, res, next) => {
 
 // -------------------- DATA DIR (Render-safe) --------------------
 function pickWritableDataDir() {
-  // 1) explicit env
   if (process.env.DATA_DIR) return process.env.DATA_DIR;
 
-  // 2) Render disk default hely (csak ha tényleg van mount)
   const candidate = "/var/data";
   try {
     fs.ensureDirSync(candidate);
     fs.accessSync(candidate, fs.constants.W_OK);
     return candidate;
   } catch (_) {
-    // 3) fallback: /tmp mindig írható konténerben
     return "/tmp/quantum-data";
   }
 }
@@ -254,11 +79,7 @@ async function loadContracts() {
   await fs.ensureDir(DATA_DIR);
 
   if (!(await fs.pathExists(CONTRACTS_FILE))) {
-    await fs.writeJson(
-      CONTRACTS_FILE,
-      { byContractId: {}, bySubscriptionId: {} },
-      { spaces: 2 }
-    );
+    await fs.writeJson(CONTRACTS_FILE, { byContractId: {}, bySubscriptionId: {} }, { spaces: 2 });
   }
   return fs.readJson(CONTRACTS_FILE);
 }
@@ -313,9 +134,7 @@ function normalizeEmail(email) {
 }
 
 function b64urlEncode(bufOrStr) {
-  const buf = Buffer.isBuffer(bufOrStr)
-    ? bufOrStr
-    : Buffer.from(String(bufOrStr), "utf8");
+  const buf = Buffer.isBuffer(bufOrStr) ? bufOrStr : Buffer.from(String(bufOrStr), "utf8");
   return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 function b64urlDecode(str) {
@@ -345,7 +164,6 @@ function verifyMagicToken(token) {
 
   const payload = b64urlDecode(parts[0]).toString("utf8");
   const sig = b64urlDecode(parts[1]);
-
   const expected = crypto.createHmac("sha256", secret).update(payload).digest();
 
   if (sig.length !== expected.length || !crypto.timingSafeEqual(sig, expected)) {
@@ -367,6 +185,98 @@ async function findCustomerByEmail(email) {
   if (!email) return null;
   const res = await stripe.customers.list({ email: normalizeEmail(email), limit: 1 });
   return res.data && res.data.length ? res.data[0] : null;
+}
+
+// ======================================================================
+// ========================== DOCUSIGN HELPERS ===========================
+// ======================================================================
+
+function stripOuterQuotes(s) {
+  s = String(s ?? "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
+  }
+  return s.trim();
+}
+
+function normalizePem(pem) {
+  pem = String(pem ?? "");
+  pem = pem.replace(/\\n/g, "\n");
+  pem = pem.replace(/\r\n/g, "\n");
+  return pem.trim();
+}
+
+/**
+ * FONTOS: Renderbe ezt vidd fel:
+ * DOCUSIGN_PRIVATE_KEY_B64 = base64(private_pkcs8.pem)  (PKCS8 PEM!)
+ * idézőjelek nélkül.
+ */
+function readDocuSignPrivateKeyPem() {
+  // Preferált: DOCUSIGN_PRIVATE_KEY_B64
+  let b64 = stripOuterQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64 || "");
+  b64 = b64.replace(/\s+/g, "");
+
+  if (b64) {
+    const decoded = Buffer.from(b64, "base64").toString("utf8");
+    const pem = normalizePem(decoded);
+
+    if (!pem) throw new Error("DOCUSIGN_PRIVATE_KEY_B64 decoded to empty string");
+    if (!pem.includes("BEGIN") || !pem.includes("PRIVATE KEY")) {
+      throw new Error("DOCUSIGN_PRIVATE_KEY_B64 decoded, but it doesn't look like PEM");
+    }
+
+    // erős validáció: Node crypto be tudja-e olvasni
+    crypto.createPrivateKey(pem);
+    return pem;
+  }
+
+  // Fallback: DOCUSIGN_PRIVATE_KEY (PEM)
+  const rawPem = normalizePem(stripOuterQuotes(process.env.DOCUSIGN_PRIVATE_KEY || ""));
+  if (rawPem) {
+    crypto.createPrivateKey(rawPem);
+    return rawPem;
+  }
+
+  throw new Error("Missing DOCUSIGN private key (set DOCUSIGN_PRIVATE_KEY_B64 or DOCUSIGN_PRIVATE_KEY)");
+}
+
+function getDocuSignConfig() {
+  const integrationKey = stripOuterQuotes(process.env.DOCUSIGN_INTEGRATION_KEY);
+  const userId = stripOuterQuotes(process.env.DOCUSIGN_USER_ID);
+  const accountId = stripOuterQuotes(process.env.DOCUSIGN_ACCOUNT_ID);
+  const templateId = stripOuterQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
+
+  const basePath = stripOuterQuotes(process.env.DOCUSIGN_BASE_PATH) || "https://demo.docusign.net/restapi";
+  const oAuthBasePath = stripOuterQuotes(process.env.DOCUSIGN_OAUTH_BASE_PATH) || "account-d.docusign.com";
+
+  if (!integrationKey || !userId || !accountId || !templateId) {
+    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)");
+  }
+
+  const privateKeyPem = readDocuSignPrivateKeyPem();
+
+  return { integrationKey, userId, accountId, templateId, basePath, oAuthBasePath, privateKeyPem };
+}
+
+async function getDocusignApiClient() {
+  const cfg = getDocuSignConfig();
+
+  const apiClient = new docusign.ApiClient();
+  apiClient.setBasePath(cfg.basePath);
+  apiClient.setOAuthBasePath(cfg.oAuthBasePath);
+
+  const results = await apiClient.requestJWTUserToken(
+    cfg.integrationKey,
+    cfg.userId,
+    ["signature", "impersonation"],
+    cfg.privateKeyPem, // <-- PEM string
+    3600
+  );
+
+  const accessToken = results.body.access_token;
+  apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
+
+  return { apiClient, cfg };
 }
 
 // -------------------- ADMIN AUTH --------------------
@@ -430,8 +340,7 @@ app.get("/api/docusign/debug-key", (req, res) => {
   }
 });
 
-
-// Egyszerű “start” endpoint (ahogy eddig használtad curl-lel)
+// Egyszerű “start” endpoint (curl-lel)
 app.post("/api/docusign/start", async (req, res) => {
   try {
     const {
@@ -463,7 +372,6 @@ app.post("/api/docusign/start", async (req, res) => {
     docusign.Configuration.default.setDefaultApiClient(apiClient);
 
     const envelopesApi = new docusign.EnvelopesApi(apiClient);
-
     const clientUserId = String(contractId || "customer-" + Date.now());
 
     const textTabs = [
@@ -491,7 +399,7 @@ app.post("/api/docusign/start", async (req, res) => {
 
     envelopeDefinition.templateRoles = [
       {
-        roleName: "Customer",
+        roleName: "Customer", // egyezzen a template role-lal
         name: String(customer_name),
         email: String(customer_email),
         clientUserId,
@@ -499,18 +407,13 @@ app.post("/api/docusign/start", async (req, res) => {
       },
     ];
 
-    const envelopeSummary = await envelopesApi.createEnvelope(cfg.accountId, {
-      envelopeDefinition,
-    });
-
+    const envelopeSummary = await envelopesApi.createEnvelope(cfg.accountId, { envelopeDefinition });
     const envelopeId = envelopeSummary.envelopeId;
 
     const baseReturn = process.env.DOCUSIGN_RETURN_URL || "https://quantumitech.hu/ugyfel";
     const returnUrl =
       baseReturn +
-      `?docusign=return&envelopeId=${encodeURIComponent(envelopeId)}&contractId=${encodeURIComponent(
-        clientUserId
-      )}`;
+      `?docusign=return&envelopeId=${encodeURIComponent(envelopeId)}&contractId=${encodeURIComponent(clientUserId)}`;
 
     const viewRequest = new docusign.RecipientViewRequest();
     viewRequest.returnUrl = returnUrl;
@@ -557,7 +460,7 @@ app.post("/api/docusign/start", async (req, res) => {
   }
 });
 
-// Kompatibilis “embedded-sign” endpoint (ha ezt akarod használni a frontendről)
+// Kompatibilis “embedded-sign” endpoint
 app.post("/api/docusign/embedded-sign", async (req, res) => {
   try {
     const customer = req.body?.customer || {};
@@ -678,17 +581,11 @@ app.post("/api/create-checkout-session", async (req, res) => {
   try {
     const { email, plan, termMonths, devicesTotal, contractId } = req.body;
 
-    if (!email || typeof email !== "string") {
-      return res.status(400).json({ error: "Missing/invalid email" });
-    }
-    if (!isValidPlan(plan)) {
-      return res.status(400).json({ error: "Invalid plan (basic/premium)" });
-    }
+    if (!email || typeof email !== "string") return res.status(400).json({ error: "Missing/invalid email" });
+    if (!isValidPlan(plan)) return res.status(400).json({ error: "Invalid plan (basic/premium)" });
 
     const term = Number(termMonths);
-    if (!isValidTerm(term)) {
-      return res.status(400).json({ error: "Invalid termMonths (12 or 36)" });
-    }
+    if (!isValidTerm(term)) return res.status(400).json({ error: "Invalid termMonths (12 or 36)" });
 
     const totalDevices = clampInt(devicesTotal, 1, 1000);
     const included = 25;
@@ -696,9 +593,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
 
     const monthlyPrice = getMonthlyPriceId(plan);
     const devicePrice = getDevicePriceId(plan);
-    if (!monthlyPrice || !devicePrice) {
-      return res.status(500).json({ error: "Missing PRICE env vars for plan" });
-    }
+    if (!monthlyPrice || !devicePrice) return res.status(500).json({ error: "Missing PRICE env vars for plan" });
 
     const commitmentEndsAt = calcCommitmentEndsAt(term);
 
@@ -717,7 +612,6 @@ app.post("/api/create-checkout-session", async (req, res) => {
       line_items: lineItems,
       success_url: `${process.env.WP_SUCCESS_URL}?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: process.env.WP_CANCEL_URL,
-
       subscription_data: {
         metadata: {
           contractId: contractId ? String(contractId) : "",
@@ -728,7 +622,6 @@ app.post("/api/create-checkout-session", async (req, res) => {
           commitmentEndsAt: String(commitmentEndsAt),
         },
       },
-
       metadata: {
         contractId: contractId ? String(contractId) : "",
         plan: String(plan),
@@ -829,8 +722,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 
       case "invoice.payment_succeeded": {
         const invoice = event.data.object;
-        const subscriptionId =
-          invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
+        const subscriptionId = invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
 
         await upsertBySubscription(subscriptionId, {
           status: "active",
@@ -839,21 +731,18 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           lastEvent: "invoice.payment_succeeded",
           updatedAt: Date.now(),
         });
-
         break;
       }
 
       case "invoice.payment_failed": {
         const invoice = event.data.object;
-        const subscriptionId =
-          invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
+        const subscriptionId = invoice.subscription || invoice.lines?.data?.[0]?.subscription || null;
 
         await upsertBySubscription(subscriptionId, {
           status: "past_due",
           lastEvent: "invoice.payment_failed",
           updatedAt: Date.now(),
         });
-
         break;
       }
 
@@ -865,7 +754,6 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
           lastEvent: "customer.subscription.deleted",
           updatedAt: Date.now(),
         });
-
         break;
       }
 
@@ -886,9 +774,7 @@ app.get("/api/admin/contracts", requireAdmin, async (req, res) => {
     let local = [];
     try {
       const db = await loadContracts();
-      local = Object.values(db.bySubscriptionId || {}).sort(
-        (a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)
-      );
+      local = Object.values(db.bySubscriptionId || {}).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
     } catch (_) {
       local = [];
     }
@@ -964,7 +850,6 @@ app.get("/api/session-status", async (req, res) => {
     });
 
     const paid = session.payment_status === "paid" || session.status === "complete";
-
     const metadata = session.metadata || {};
     const sub = session.subscription && typeof session.subscription === "object" ? session.subscription : null;
 
@@ -1045,15 +930,9 @@ app.post("/api/request-cancel", async (req, res) => {
         subscriptionId,
         email: row?.email || "",
         plan: row?.plan || stripeSub?.metadata?.plan || "",
-        termMonths:
-          row?.termMonths ||
-          (stripeSub?.metadata?.termMonths ? Number(stripeSub.metadata.termMonths) : null),
-        devicesTotal:
-          row?.devicesTotal ||
-          (stripeSub?.metadata?.devicesTotal ? Number(stripeSub.metadata.devicesTotal) : null),
-        extraDevices:
-          row?.extraDevices ||
-          (stripeSub?.metadata?.extraDevices ? Number(stripeSub.metadata.extraDevices) : null),
+        termMonths: row?.termMonths || (stripeSub?.metadata?.termMonths ? Number(stripeSub.metadata.termMonths) : null),
+        devicesTotal: row?.devicesTotal || (stripeSub?.metadata?.devicesTotal ? Number(stripeSub.metadata.devicesTotal) : null),
+        extraDevices: row?.extraDevices || (stripeSub?.metadata?.extraDevices ? Number(stripeSub.metadata.extraDevices) : null),
         commitmentEndsAt: commitmentEndsAt || null,
         status: updated.status,
       };
@@ -1101,13 +980,10 @@ app.post("/api/request-cancel", async (req, res) => {
 app.post("/api/create-portal-session", async (req, res) => {
   try {
     const { session_id, subscriptionId, email } = req.body || {};
-
     let customerId = null;
 
     if (session_id) {
-      const session = await stripe.checkout.sessions.retrieve(String(session_id), {
-        expand: ["subscription"],
-      });
+      const session = await stripe.checkout.sessions.retrieve(String(session_id), { expand: ["subscription"] });
 
       customerId =
         (typeof session.customer === "string" && session.customer) ||
@@ -1115,11 +991,7 @@ app.post("/api/create-portal-session", async (req, res) => {
         null;
 
       if (!customerId && session.subscription) {
-        const subId =
-          typeof session.subscription === "string"
-            ? session.subscription
-            : session.subscription.id;
-
+        const subId = typeof session.subscription === "string" ? session.subscription : session.subscription.id;
         const sub = await stripe.subscriptions.retrieve(subId);
         customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id || null;
       }
@@ -1142,10 +1014,7 @@ app.post("/api/create-portal-session", async (req, res) => {
     }
 
     if (!customerId) {
-      return res.status(400).json({
-        error: "Missing customer",
-        details: "Adj meg session_id-t vagy subscriptionId-t.",
-      });
+      return res.status(400).json({ error: "Missing customer", details: "Adj meg session_id-t vagy subscriptionId-t." });
     }
 
     const portalSession = await stripe.billingPortal.sessions.create({
@@ -1156,10 +1025,7 @@ app.post("/api/create-portal-session", async (req, res) => {
     return res.json({ url: portalSession.url });
   } catch (err) {
     console.error("create-portal-session error:", err);
-    return res.status(500).json({
-      error: "Server error",
-      details: err?.message || String(err),
-    });
+    return res.status(500).json({ error: "Server error", details: err?.message || String(err) });
   }
 });
 
@@ -1168,24 +1034,19 @@ app.post("/api/portal/magic-request", async (req, res) => {
   try {
     const emailRaw = req.body && req.body.email;
     const email = normalizeEmail(emailRaw);
-    if (!email || !email.includes("@")) {
-      return res.status(400).json({ ok: false, error: "Invalid email" });
-    }
+    if (!email || !email.includes("@")) return res.status(400).json({ ok: false, error: "Invalid email" });
 
     const customer = await findCustomerByEmail(email);
 
-    // mindig ugyanazt válaszoljuk (ne lehessen emailt "kitalálni")
     if (customer) {
       const token = signMagicToken(email, 10 * 60);
 
       const fallbackBase = `${req.protocol}://${req.get("host")}`;
       const base = (process.env.FRONTEND_BASE || fallbackBase).replace(/\/+$/g, "");
-
       const magicUrl = `${base}/api/portal/magic?token=${encodeURIComponent(token)}`;
 
       const subject = "Quantum ITech - Belépő link az ügyfélportálhoz";
-      const text =
-`Szia!
+      const text = `Szia!
 
 Kattints a lenti linkre az ügyfélportál megnyitásához (a link 10 percig érvényes):
 ${magicUrl}
@@ -1195,8 +1056,7 @@ Ha nem te kérted, hagyd figyelmen kívül ezt az üzenetet.
 Üdv,
 Quantum ITech`;
 
-      const html =
-`<p>Szia!</p>
+      const html = `<p>Szia!</p>
 <p>Kattints a belépéshez (a link 10 percig érvényes):</p>
 <p><a href="${magicUrl}">Belépés</a></p>
 <p>Ha nem te kérted, hagyd figyelmen kívül.</p>
@@ -1205,10 +1065,7 @@ Quantum ITech`;
       await sendMailSafe({ to: email, subject, text, html });
     }
 
-    return res.json({
-      ok: true,
-      message: "Ha létezik előfizetés ehhez az emailhez, elküldtük a belépő linket."
-    });
+    return res.json({ ok: true, message: "Ha létezik előfizetés ehhez az emailhez, elküldtük a belépő linket." });
   } catch (e) {
     console.error("magic-request error:", e);
     return res.status(500).json({ ok: false, error: "Server error", details: e?.message || String(e) });
@@ -1229,11 +1086,7 @@ app.get("/api/portal/magic", async (req, res) => {
     }
 
     const returnUrl = process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "https://quantumitech.hu/";
-
-    const session = await stripe.billingPortal.sessions.create({
-      customer: customer.id,
-      return_url: returnUrl,
-    });
+    const session = await stripe.billingPortal.sessions.create({ customer: customer.id, return_url: returnUrl });
 
     return res.redirect(302, session.url);
   } catch (e) {
