@@ -10,6 +10,7 @@ const crypto = require("crypto");
 const { Resend } = require("resend");
 const docusign = require("docusign-esign");
 
+
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -205,6 +206,48 @@ async function findCustomerByEmail(email) {
   return res.data && res.data.length ? res.data[0] : null;
 }
 
+function getDocuSignConfig() {
+  const integrationKey = process.env.DOCUSIGN_INTEGRATION_KEY; // aka client_id
+  const userId = process.env.DOCUSIGN_USER_ID;                 // Felhasználói azonosító
+  const accountId = process.env.DOCUSIGN_ACCOUNT_ID;           // API-fiók azonosítója
+  const basePath = process.env.DOCUSIGN_BASE_PATH || "https://demo.docusign.net/restapi";
+  const oAuthBasePath = process.env.DOCUSIGN_OAUTH_BASE_PATH || "account-d.docusign.com";
+  const templateId = process.env.DOCUSIGN_TEMPLATE_ID;
+  let privateKey = process.env.DOCUSIGN_PRIVATE_KEY || "";
+
+  // Render/ENV-ben gyakori, hogy \n stringként van -> alakítsuk vissza
+  privateKey = privateKey.replace(/\\n/g, "\n");
+
+  if (!integrationKey || !userId || !accountId || !privateKey || !templateId) {
+    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, PRIVATE_KEY, TEMPLATE_ID)");
+  }
+
+  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKey };
+}
+
+async function getDocusignApiClient() {
+  const cfg = getDocuSignConfig();
+  const apiClient = new docusign.ApiClient();
+  apiClient.setBasePath(cfg.basePath);
+  apiClient.setOAuthBasePath(cfg.oAuthBasePath);
+
+  // JWT token
+  const results = await apiClient.requestJWTUserToken(
+    cfg.integrationKey,
+    cfg.userId,
+    ["signature", "impersonation"],
+    cfg.privateKey,
+    3600
+  );
+
+  const accessToken = results.body.access_token;
+  apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
+
+  return { apiClient, cfg };
+}
+
+
+
 // -------------------- ADMIN AUTH --------------------
 function requireAdmin(req, res, next) {
   const token =
@@ -229,6 +272,126 @@ app.get("/", (req, res) => {
 app.get("/api/docusign/ping", (req, res) => {
   return res.json({ ok: true, service: "docusign", time: new Date().toISOString() });
 });
+
+app.post("/api/docusign/start", async (req, res) => {
+  try {
+    const {
+      // signer
+      customer_name,
+      customer_email,
+
+      // extra data fields (amit a szerződésbe töltesz)
+      company_name,
+      customer_phone,
+      billing_address,
+      tax_number,
+
+      // csomag / díjak
+      plan_name,
+      term_months,
+      devices_total,
+      extra_devices,
+      monthly_base_price,
+      extra_device_price,
+      setup_fee,
+      monthly_total,
+
+      // saját azonosító (jó, ha van)
+      contractId,
+    } = req.body || {};
+
+    if (!customer_name || !customer_email) {
+      return res.status(400).json({ error: "Missing customer_name / customer_email" });
+    }
+
+    const { apiClient, cfg } = await getDocusignApiClient();
+    docusign.Configuration.default.setDefaultApiClient(apiClient);
+
+    const envelopesApi = new docusign.EnvelopesApi(apiClient);
+
+    // Embedded signing-hoz kell egy clientUserId (bármi stabil string)
+    const clientUserId = String(contractId || "customer-" + Date.now());
+
+    // Template mezők kitöltése tabLabel alapján
+    // FONTOS: ezeknek a tabLabel-eknek egyezniük kell a template-ben lévő mezők Tab Label-jével
+    const textTabs = [
+      { tabLabel: "customer_name", value: String(customer_name) },
+      { tabLabel: "customer_email", value: String(customer_email) },
+      { tabLabel: "company_name", value: String(company_name || "") },
+      { tabLabel: "customer_phone", value: String(customer_phone || "") },
+      { tabLabel: "billing_address", value: String(billing_address || "") },
+      { tabLabel: "tax_number", value: String(tax_number || "") },
+
+      { tabLabel: "plan_name", value: String(plan_name || "") },
+      { tabLabel: "term_months", value: String(term_months || "") },
+      { tabLabel: "devices_total", value: String(devices_total || "") },
+      { tabLabel: "extra_devices", value: String(extra_devices || "") },
+
+      { tabLabel: "monthly_base_price", value: String(monthly_base_price || "") },
+      { tabLabel: "extra_device_price", value: String(extra_device_price || "") },
+      { tabLabel: "setup_fee", value: String(setup_fee || "") },
+      { tabLabel: "monthly_total", value: String(monthly_total || "") },
+
+      // ha van ilyen nálad a template-ben:
+      // { tabLabel: "sum_period", value: String(term_months || "") },
+    ];
+
+    const envelopeDefinition = new docusign.EnvelopeDefinition();
+    envelopeDefinition.templateId = cfg.templateId;
+    envelopeDefinition.status = "sent"; // azonnal küldhető aláírásra
+
+    // Template role = Customer (pontosan így!)
+    envelopeDefinition.templateRoles = [
+      {
+        roleName: "Customer",
+        name: String(customer_name),
+        email: String(customer_email),
+        clientUserId, // ez teszi "embedded"-dé
+        tabs: { textTabs },
+      },
+    ];
+
+    // 1) Envelope létrehozása template-ből
+    const envelopeSummary = await envelopesApi.createEnvelope(cfg.accountId, {
+      envelopeDefinition,
+    });
+
+    const envelopeId = envelopeSummary.envelopeId;
+
+    // 2) Embedded signing view (recipient view) link
+    const returnUrl =
+      (process.env.DOCUSIGN_RETURN_URL || "https://quantumitech.hu/ugyfel") +
+      `?docusign=return&envelopeId=${encodeURIComponent(envelopeId)}&contractId=${encodeURIComponent(clientUserId)}`;
+
+    const viewRequest = new docusign.RecipientViewRequest();
+    viewRequest.returnUrl = returnUrl;
+    viewRequest.authenticationMethod = "none";
+    viewRequest.email = String(customer_email);
+    viewRequest.userName = String(customer_name);
+    viewRequest.clientUserId = clientUserId;
+
+    // recipientId template-nél gyakran "1" – ha gond lenne, akkor recipients listából kell lekérni
+    viewRequest.recipientId = "1";
+
+    const viewResult = await envelopesApi.createRecipientView(cfg.accountId, envelopeId, {
+      recipientViewRequest: viewRequest,
+    });
+
+    return res.json({
+      ok: true,
+      envelopeId,
+      contractId: clientUserId,
+      signingUrl: viewResult.url,
+    });
+  } catch (err) {
+    console.error("DOCUSIGN start error:", err?.response?.body || err?.message || err);
+    return res.status(500).json({
+      error: "DocuSign start failed",
+      details: err?.response?.body || err?.message || String(err),
+    });
+  }
+});
+
 
 app.get("/api/docusign/test-sign", (req, res) => {
   // Ez csak teszt endpoint, hogy lássuk elérhető-e
@@ -943,3 +1106,30 @@ app.post("/api/docusign/embedded-sign", async (req, res) => {
 // -------------------- START --------------------
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on :${port}, DATA_DIR=${DATA_DIR}`));
+
+app.get("/api/docusign/envelope-status", async (req, res) => {
+  try {
+    const envelopeId = String(req.query.envelopeId || "").trim();
+    if (!envelopeId) return res.status(400).json({ error: "Missing envelopeId" });
+
+    const { apiClient, cfg } = await getDocusignApiClient();
+    docusign.Configuration.default.setDefaultApiClient(apiClient);
+
+    const envelopesApi = new docusign.EnvelopesApi(apiClient);
+    const envelope = await envelopesApi.getEnvelope(cfg.accountId, envelopeId);
+
+    return res.json({
+      ok: true,
+      envelopeId,
+      status: envelope.status,
+      completedDateTime: envelope.completedDateTime || null,
+    });
+  } catch (err) {
+    console.error("DOCUSIGN status error:", err?.response?.body || err?.message || err);
+    return res.status(500).json({
+      error: "DocuSign status failed",
+      details: err?.response?.body || err?.message || String(err),
+    });
+  }
+});
+
