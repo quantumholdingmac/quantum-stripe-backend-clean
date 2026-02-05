@@ -194,19 +194,32 @@ async function getDocusignApiClient() {
   apiClient.setBasePath(cfg.basePath);
   apiClient.setOAuthBasePath(cfg.oAuthBasePath);
 
-  const results = await apiClient.requestJWTUserToken(
-    cfg.integrationKey,
-    cfg.userId,
-    ["signature", "impersonation"],
-    cfg.privateKeyPem, // STRING PEM
-    3600
-  );
+  let results;
+  try {
+    results = await apiClient.requestJWTUserToken(
+      cfg.integrationKey,
+      cfg.userId,
+      ["signature", "impersonation"],
+      cfg.privateKey,
+      3600
+    );
+  } catch (err) {
+    console.error("DOCUSIGN JWT error:", {
+      message: err?.message,
+      status: err?.response?.status,
+      body: err?.response?.body,
+      text: err?.response?.text,
+      data: err?.response?.data,
+    });
+    throw err;
+  }
 
   const accessToken = results.body.access_token;
   apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
 
   return { apiClient, cfg };
 }
+
 
 
 
@@ -518,10 +531,28 @@ app.post("/api/docusign/start", async (req, res) => {
       signingUrl: viewResult.url,
     });
   } catch (err) {
-    console.error("DOCUSIGN start error:", err?.response?.body || err?.message || err);
+    const status = err?.response?.status;
+    const body = err?.response?.body;
+    const text = err?.response?.text;
+    const data = err?.response?.data;
+
+    console.error("DOCUSIGN start error:", {
+      message: err?.message,
+      status,
+      body,
+      text,
+      data,
+    });
+
     return res.status(500).json({
       error: "DocuSign start failed",
-      details: err?.response?.body || err?.message || String(err),
+      details: {
+        message: err?.message || String(err),
+        status: status || null,
+        body: body || null,
+        text: text || null,
+        data: data || null,
+      },
     });
   }
 });
