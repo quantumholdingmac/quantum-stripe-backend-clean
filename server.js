@@ -128,7 +128,7 @@ function getDocuSignPrivateKeyPem() {
 }
 
 function getDocuSignConfig() {
-  const integrationKey = stripQuotes(process.env.DOCUSIGN_INTEGRATION_KEY); // client_id
+  const integrationKey = stripQuotes(process.env.DOCUSIGN_INTEGRATION_KEY);
   const userId = stripQuotes(process.env.DOCUSIGN_USER_ID);
   const accountId = stripQuotes(process.env.DOCUSIGN_ACCOUNT_ID);
   const basePath =
@@ -137,29 +137,28 @@ function getDocuSignConfig() {
     stripQuotes(process.env.DOCUSIGN_OAUTH_BASE_PATH) || "account-d.docusign.com";
   const templateId = stripQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
 
-  const privateKeyPem = getDocuSignPrivateKeyPem();
+  const b64 = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64);
+  if (!b64) {
+    throw new Error("Missing DOCUSIGN_PRIVATE_KEY_B64");
+  }
+
+  const pem = Buffer.from(b64, "base64")
+    .toString("utf8")
+    .replace(/\r\n/g, "\n")
+    .trim();
+
+  const looksLikePem = pem.includes("BEGIN PRIVATE KEY") || pem.includes("BEGIN RSA PRIVATE KEY");
+  if (!looksLikePem) {
+    throw new Error("Decoded key is not PEM private key");
+  }
 
   if (!integrationKey || !userId || !accountId || !templateId) {
-    throw new Error(
-      "Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)"
-    );
-  }
-  if (!privateKeyPem) {
-    throw new Error(
-      "DOCUSIGN private key is missing (use DOCUSIGN_PRIVATE_KEY_B64 recommended)"
-    );
+    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)");
   }
 
-  return {
-    integrationKey,
-    userId,
-    accountId,
-    basePath,
-    oAuthBasePath,
-    templateId,
-    privateKeyPem, // <-- STRING! (ne Buffer)
-  };
+  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKey: pem };
 }
+
 
 async function getDocusignApiClient() {
   const cfg = getDocuSignConfig();
@@ -180,12 +179,13 @@ async function getDocusignApiClient() {
   }
 
   const results = await apiClient.requestJWTUserToken(
-    cfg.integrationKey,
-    cfg.userId,
-    ["signature", "impersonation"],
-    keyObject, // ✅ KeyObject, nem string
-    3600
-  );
+  cfg.integrationKey,
+  cfg.userId,
+  ["signature", "impersonation"],
+  cfg.privateKey, // STRING PEM
+  3600
+);
+
 
   const accessToken = results.body.access_token;
   apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
