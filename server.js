@@ -8,6 +8,7 @@ const path = require("path");
 const Stripe = require("stripe");
 const crypto = require("crypto");
 const { Resend } = require("resend");
+const docusign = require("docusign-esign");
 
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -709,9 +710,6 @@ app.post("/api/create-portal-session", async (req, res) => {
 });
 
 // -------------------- MAGIC-LINK PORTAL FLOW --------------------
-// POST /api/portal/magic-request  { email }
-// GET  /api/portal/magic?token=...  -> redirect to stripe portal
-// --------------------
 app.post("/api/portal/magic-request", async (req, res) => {
   try {
     const emailRaw = req.body && req.body.email;
@@ -790,6 +788,144 @@ app.get("/api/portal/magic", async (req, res) => {
     console.error("magic consume error:", e?.message || e);
     const returnUrl = process.env.PORTAL_RETURN_URL || process.env.WP_SUCCESS_URL || "/";
     return res.redirect(`${returnUrl}?portal_error=invalid_token`);
+  }
+});
+
+
+// ======================================================================
+// ===================== DOCUSIGN EMBEDDED SIGNING =======================
+// ======================================================================
+
+function getDsPrivateKey() {
+  const raw = process.env.DOCUSIGN_PRIVATE_KEY_PEM || "";
+  return raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
+}
+
+async function getDsAccessToken() {
+  const integratorKey = process.env.DOCUSIGN_INTEGRATION_KEY;
+  const userId = process.env.DOCUSIGN_USER_ID;
+
+  if (!integratorKey) throw new Error("Missing DOCUSIGN_INTEGRATION_KEY");
+  if (!userId) throw new Error("Missing DOCUSIGN_USER_ID");
+
+  const privateKey = getDsPrivateKey();
+  if (!privateKey) throw new Error("Missing DOCUSIGN_PRIVATE_KEY_PEM");
+
+  const apiClient = new docusign.ApiClient();
+
+  // DEMO: account-d ; PROD: account
+  apiClient.setOAuthBasePath(process.env.DOCUSIGN_OAUTH_BASE_PATH || "account-d.docusign.com");
+
+  const expiresIn = 60 * 60;
+  const scopes = ["signature", "impersonation"];
+
+  const res = await apiClient.requestJWTUserToken(
+    integratorKey,
+    userId,
+    scopes,
+    privateKey,
+    expiresIn
+  );
+
+  return res.body.access_token;
+}
+
+function makeDsApiClient(accessToken) {
+  const apiClient = new docusign.ApiClient();
+  apiClient.setBasePath(process.env.DOCUSIGN_BASE_PATH || "https://demo.docusign.net/restapi");
+  apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
+  return apiClient;
+}
+
+/**
+ * POST /api/docusign/embedded-sign
+ * body: {
+ *   customer: { name, email, company, phone, billingAddress, taxNumber },
+ *   order: { planName, termMonths, devicesTotal, extraDevices, monthlyBasePrice, extraDevicePrice, setupFee, monthlyTotal }
+ * }
+ */
+app.post("/api/docusign/embedded-sign", async (req, res) => {
+  try {
+    const templateId = process.env.DOCUSIGN_TEMPLATE_ID;
+    const accountId = process.env.DOCUSIGN_ACCOUNT_ID;
+    const returnUrl = process.env.DOCUSIGN_RETURN_URL;
+
+    if (!templateId) return res.status(500).json({ error: "Missing DOCUSIGN_TEMPLATE_ID" });
+    if (!accountId) return res.status(500).json({ error: "Missing DOCUSIGN_ACCOUNT_ID" });
+    if (!returnUrl) return res.status(500).json({ error: "Missing DOCUSIGN_RETURN_URL" });
+
+    const customer = req.body?.customer || {};
+    const order = req.body?.order || {};
+
+    const customerName = String(customer.name || "").trim();
+    const customerEmail = String(customer.email || "").trim().toLowerCase();
+
+    if (!customerName) return res.status(400).json({ error: "Missing customer.name" });
+    if (!customerEmail || !customerEmail.includes("@")) {
+      return res.status(400).json({ error: "Missing/invalid customer.email" });
+    }
+
+    const accessToken = await getDsAccessToken();
+    const apiClient = makeDsApiClient(accessToken);
+
+    const envDef = new docusign.EnvelopeDefinition();
+    envDef.templateId = templateId;
+    envDef.status = "sent"; // embedded signinghez ez kell
+
+    const signer = docusign.TemplateRole.constructFromObject({
+      roleName: "Customer",   // FONTOS: egyezzen a template role névvel!
+      name: customerName,
+      email: customerEmail,
+      clientUserId: "customer-1", // embedded azonosító
+      tabs: docusign.Tabs.constructFromObject({
+        textTabs: [
+          { tabLabel: "customer_name", value: customerName },
+          { tabLabel: "company_name", value: String(customer.company || "") },
+          { tabLabel: "customer_email", value: customerEmail },
+          { tabLabel: "customer_phone", value: String(customer.phone || "") },
+          { tabLabel: "billing_address", value: String(customer.billingAddress || "") },
+          { tabLabel: "tax_number", value: String(customer.taxNumber || "") },
+
+          { tabLabel: "plan_name", value: String(order.planName || "") },
+          { tabLabel: "term_months", value: String(order.termMonths || "") },
+          { tabLabel: "devices_total", value: String(order.devicesTotal || "") },
+          { tabLabel: "extra_devices", value: String(order.extraDevices || "") },
+
+          { tabLabel: "monthly_base_price", value: String(order.monthlyBasePrice || "") },
+          { tabLabel: "extra_device_price", value: String(order.extraDevicePrice || "") },
+          { tabLabel: "setup_fee", value: String(order.setupFee || "") },
+          { tabLabel: "monthly_total", value: String(order.monthlyTotal || "") },
+
+          { tabLabel: "sum_period", value: order.termMonths ? `${order.termMonths} hónap` : "" },
+        ],
+      }),
+    });
+
+    envDef.templateRoles = [signer];
+
+    const envelopesApi = new docusign.EnvelopesApi(apiClient);
+
+    const createRes = await envelopesApi.createEnvelope(accountId, { envelopeDefinition: envDef });
+    const envelopeId = createRes.envelopeId;
+
+    const viewReq = new docusign.RecipientViewRequest();
+    viewReq.returnUrl = returnUrl;
+    viewReq.authenticationMethod = "none";
+    viewReq.email = customerEmail;
+    viewReq.userName = customerName;
+    viewReq.clientUserId = "customer-1";
+
+    const viewRes = await envelopesApi.createRecipientView(accountId, envelopeId, {
+      recipientViewRequest: viewReq,
+    });
+
+    return res.json({ ok: true, envelopeId, url: viewRes.url });
+  } catch (e) {
+    console.error("docusign embedded-sign error:", e?.message || e);
+    return res.status(500).json({
+      error: "DocuSign error",
+      details: e?.message || String(e),
+    });
   }
 });
 
