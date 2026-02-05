@@ -319,6 +319,8 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
+
+
 // -------------------- HEALTH --------------------
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "quantum-stripe-backend", dataDir: DATA_DIR });
@@ -1044,6 +1046,28 @@ app.post("/api/create-portal-session", async (req, res) => {
     });
   }
 });
+
+app.get("/api/docusign/debug-key", (req, res) => {
+  try {
+    const cfg = getDocuSignConfig();
+
+    // cfg.privateKey Buffer -> string a vizsgálathoz
+    const pem = cfg.privateKey.toString("utf8");
+    const firstLine = pem.split("\n")[0] || "";
+
+    return res.json({
+      ok: true,
+      firstLine,
+      length: pem.length,
+      hasBegin: pem.includes("BEGIN"),
+      hasPrivateKey: pem.includes("PRIVATE KEY"),
+      hasRSA: pem.includes("RSA PRIVATE KEY"),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
 
 // -------------------- MAGIC-LINK PORTAL FLOW --------------------
 app.post("/api/portal/magic-request", async (req, res) => {
