@@ -238,42 +238,49 @@ function getDocuSignPrivateKeyPem() {
   return raw;
 }
 
-function getDocuSignConfig() {
-  const integrationKey = process.env.DOCUSIGN_INTEGRATION_KEY; // client_id
-  const userId = process.env.DOCUSIGN_USER_ID;                 // User GUID
-  const accountId = process.env.DOCUSIGN_ACCOUNT_ID;           // API Account ID
-  const basePath = process.env.DOCUSIGN_BASE_PATH || "https://demo.docusign.net/restapi";
-  const oAuthBasePath = process.env.DOCUSIGN_OAUTH_BASE_PATH || "account-d.docusign.com";
-  const templateId = process.env.DOCUSIGN_TEMPLATE_ID;
-
-  // ✅ támogatjuk mindkét formát:
-  // - DOCUSIGN_PRIVATE_KEY_B64 (base64)
-  // - DOCUSIGN_PRIVATE_KEY (közvetlen PEM)
-  const privateKeyB64 = (process.env.DOCUSIGN_PRIVATE_KEY_B64 || "").trim();
-  let privateKeyPem = (process.env.DOCUSIGN_PRIVATE_KEY || "").trim();
-
-  if (!privateKeyPem && privateKeyB64) {
-    // ha base64-ben van, dekódoljuk PEM-re
-    privateKeyPem = Buffer.from(privateKeyB64, "base64").toString("utf8").trim();
+function stripQuotes(s) {
+  s = String(s || "").trim();
+  // ha véletlenül idézőjellel kerül be: "...."
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    s = s.slice(1, -1);
   }
-
-  // ha valamiért \n literálisan van benne
-  privateKeyPem = privateKeyPem.replace(/\\n/g, "\n").trim();
-
-  // ✅ gyors validáció (nem szivárogtat kulcsot)
-  const looksLikePem =
-    privateKeyPem.includes("BEGIN RSA PRIVATE KEY") ||
-    privateKeyPem.includes("BEGIN PRIVATE KEY");
-
-  if (!integrationKey || !userId || !accountId || !templateId || !privateKeyPem) {
-    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, PRIVATE_KEY(_B64), TEMPLATE_ID)");
-  }
-  if (!looksLikePem) {
-    throw new Error("DOCUSIGN private key is not PEM format after decoding (missing BEGIN ... PRIVATE KEY header)");
-  }
-
-  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKeyPem };
+  return s.trim();
 }
+
+function getDocuSignConfig() {
+  const integrationKey = stripQuotes(process.env.DOCUSIGN_INTEGRATION_KEY);
+  const userId = stripQuotes(process.env.DOCUSIGN_USER_ID);
+  const accountId = stripQuotes(process.env.DOCUSIGN_ACCOUNT_ID);
+  const basePath = stripQuotes(process.env.DOCUSIGN_BASE_PATH) || "https://demo.docusign.net/restapi";
+  const oAuthBasePath = stripQuotes(process.env.DOCUSIGN_OAUTH_BASE_PATH) || "account-d.docusign.com";
+  const templateId = stripQuotes(process.env.DOCUSIGN_TEMPLATE_ID);
+
+  const b64 = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY_B64);
+  let pem = stripQuotes(process.env.DOCUSIGN_PRIVATE_KEY); // ha valaki PEM-ben adná
+
+  if (!pem && b64) {
+    pem = Buffer.from(b64, "base64").toString("utf8");
+  }
+
+  // ha \n literálisan van benne
+  pem = String(pem || "").replace(/\\n/g, "\n").trim();
+
+  const looksLikePem =
+    pem.includes("BEGIN RSA PRIVATE KEY") || pem.includes("BEGIN PRIVATE KEY");
+
+  if (!integrationKey || !userId || !accountId || !templateId) {
+    throw new Error("Missing DOCUSIGN env vars (INTEGRATION_KEY, USER_ID, ACCOUNT_ID, TEMPLATE_ID)");
+  }
+  if (!pem || !looksLikePem) {
+    throw new Error("DOCUSIGN private key is missing or not PEM after decoding (check DOCUSIGN_PRIVATE_KEY_B64 / DOCUSIGN_PRIVATE_KEY)");
+  }
+
+  // ✅ itt a kulcsot Bufferként adjuk tovább
+  const privateKey = Buffer.from(pem, "utf8");
+
+  return { integrationKey, userId, accountId, basePath, oAuthBasePath, templateId, privateKey };
+}
+
 
 async function getDocusignApiClient() {
   const cfg = getDocuSignConfig();
@@ -282,12 +289,13 @@ async function getDocusignApiClient() {
   apiClient.setOAuthBasePath(cfg.oAuthBasePath);
 
   const results = await apiClient.requestJWTUserToken(
-    cfg.integrationKey,
-    cfg.userId,
-    ["signature", "impersonation"],
-    cfg.privateKeyPem, // ✅ itt már PEM megy be
-    3600
-  );
+  cfg.integrationKey,
+  cfg.userId,
+  ["signature", "impersonation"],
+  cfg.privateKey,   // ✅ Buffer
+  3600
+);
+
 
   const accessToken = results.body.access_token;
   apiClient.addDefaultHeader("Authorization", "Bearer " + accessToken);
