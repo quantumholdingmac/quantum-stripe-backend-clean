@@ -705,18 +705,42 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
         });
 
         if (session.customer_email) {
-          await sendMailSafe({
-            to: session.customer_email,
-            subject: "Quantum ITech - Sikeres előfizetés",
-            text:
-              "Sikeres fizetés és előfizetés létrejött.\n\n" +
-              "Csomag: " + planLabel(session.metadata?.plan || "") + "\n" +
-              "Szerződés hossza (hó): " + (session.metadata?.termMonths || "") + "\n" +
-              "Eszközök száma: " + (session.metadata?.devicesTotal || "") + "\n" +
-              "Előfizetés azonosító: " + (subscriptionId || "") + "\n\n" +
-              "Köszönjük,\nQuantum ITech",
-          });
-        }
+  const envId = session.metadata?.envelopeId || "";
+  const contractDownloadUrl = envId
+    ? `${PUBLIC_BACKEND_BASE}/api/docusign/download?envelopeId=${encodeURIComponent(envId)}`
+    : "";
+
+  const text =
+    "Sikeres fizetés és előfizetés létrejött.\n\n" +
+    "Csomag: " + planLabel(session.metadata?.plan || "") + "\n" +
+    "Szerződés hossza (hó): " + (session.metadata?.termMonths || "") + "\n" +
+    "Eszközök száma: " + (session.metadata?.devicesTotal || "") + "\n" +
+    "Előfizetés azonosító: " + (subscriptionId || "") + "\n" +
+    (contractDownloadUrl ? ("\nSzerződés letöltése (PDF):\n" + contractDownloadUrl + "\n") : "") +
+    "\nKöszönjük,\nQuantum ITech";
+
+  const html =
+    `<p>Sikeres fizetés és előfizetés létrejött.</p>` +
+    `<ul>` +
+    `<li><strong>Csomag:</strong> ${planLabel(session.metadata?.plan || "")}</li>` +
+    `<li><strong>Szerződés hossza (hó):</strong> ${session.metadata?.termMonths || ""}</li>` +
+    `<li><strong>Eszközök száma:</strong> ${session.metadata?.devicesTotal || ""}</li>` +
+    `<li><strong>Előfizetés azonosító:</strong> ${subscriptionId || ""}</li>` +
+    `</ul>` +
+    (contractDownloadUrl
+      ? `<p><strong>Szerződés letöltése (PDF):</strong> <a href="${contractDownloadUrl}">Letöltés</a></p>`
+      : ``) +
+    `<p>Köszönjük,<br/>Quantum ITech</p>`;
+
+  await sendMailSafe({
+    to: session.customer_email,
+    subject: "Quantum ITech - Sikeres előfizetés",
+    text,
+    html,
+  });
+}
+
+
         break;
       }
 
@@ -804,6 +828,10 @@ app.get("/api/admin/contracts", requireAdmin, async (req, res) => {
     return res.status(500).json({ error: "Server error", details: e?.message || String(e) });
   }
 });
+
+const PUBLIC_BACKEND_BASE =
+  (process.env.PUBLIC_BACKEND_BASE || "").replace(/\/+$/g, "") ||
+  "https://quantum-stripe-backend-clean.onrender.com";
 
 app.get("/api/admin/contract", requireAdmin, async (req, res) => {
   try {
