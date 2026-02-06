@@ -279,6 +279,28 @@ async function getDocusignApiClient() {
   return { apiClient, cfg };
 }
 
+/**
+ * Biztonságos returnUrl építés:
+ * - URLSearchParams-szal állítjuk be a queryt, nincs dupla encode.
+ */
+function buildSafeReturnUrl(rawReturnUrl, { envelopeId, contractId, event }) {
+  let u;
+  try {
+    u = new URL(String(rawReturnUrl));
+  } catch (e) {
+    // fallback: ha valamiért nem URL, akkor a régi env alapján próbáljuk
+    const fallback = process.env.DOCUSIGN_RETURN_URL || "https://quantumitech.hu/megrendeles/";
+    u = new URL(String(fallback));
+  }
+
+  u.searchParams.set("docusign", "return");
+  if (envelopeId) u.searchParams.set("envelopeId", String(envelopeId));
+  if (contractId) u.searchParams.set("contractId", String(contractId));
+  if (event) u.searchParams.set("event", String(event));
+
+  return u.toString();
+}
+
 // -------------------- ADMIN AUTH --------------------
 function requireAdmin(req, res, next) {
   const token =
@@ -340,29 +362,35 @@ app.get("/api/docusign/debug-key", (req, res) => {
   }
 });
 
-// Egyszerű “start” endpoint (curl-lel)
+// Egyszerű “start” endpoint (WP-nek)
+// FONTOS: most már a kliens (WP) küldi a returnUrl-t és a backend abba fűzi bele az envelopeId-t.
 app.post("/api/docusign/start", async (req, res) => {
   try {
-    const {
-      customer_name,
-      customer_email,
+    const body = req.body || {};
 
-      company_name,
-      customer_phone,
-      billing_address,
-      tax_number,
+    // Kliens oldali mezőnevek (a WP-ből így küldjük)
+    const customer_name = body.customer_name;
+    const customer_email = body.customer_email;
 
-      plan_name,
-      term_months,
-      devices_total,
-      extra_devices,
-      monthly_base_price,
-      extra_device_price,
-      setup_fee,
-      monthly_total,
+    const company_name = body.company_name;
+    const customer_phone = body.customer_phone;
+    const billing_address = body.billing_address;
+    const tax_number = body.tax_number;
 
-      contractId,
-    } = req.body || {};
+    // A WP-ben plan/term/devices számolva van, itt alakítjuk DocuSign tabokra:
+    const plan = body.plan; // basic/premium
+    const plan_name = body.plan_name || (isValidPlan(plan) ? planLabel(plan) : (body.plan_name || ""));
+    const term_months = body.term_months ?? body.termMonths ?? body.term_months;
+    const devices_total = body.devices_total ?? body.devicesTotal;
+    const extra_devices = body.extra_devices ?? body.extraDevices;
+
+    const monthly_base_price = body.monthly_base_price ?? body.monthlyBasePrice;
+    const extra_device_price = body.extra_device_price ?? body.extraDevicePrice;
+    const setup_fee = body.setup_fee ?? body.setupFee;
+    const monthly_total = body.monthly_total ?? body.monthlyTotal;
+
+    const contractId = body.contractId; // stabil ID WP-ből
+    const rawReturnUrl = body.returnUrl || process.env.DOCUSIGN_RETURN_URL || "https://quantumitech.hu/megrendeles/";
 
     if (!customer_name || !customer_email) {
       return res.status(400).json({ error: "Missing customer_name / customer_email" });
@@ -372,6 +400,8 @@ app.post("/api/docusign/start", async (req, res) => {
     docusign.Configuration.default.setDefaultApiClient(apiClient);
 
     const envelopesApi = new docusign.EnvelopesApi(apiClient);
+
+    // clientUserId kell az embedded signinghoz. Nálad contractId-t használjuk.
     const clientUserId = String(contractId || "customer-" + Date.now());
 
     const textTabs = [
@@ -410,10 +440,12 @@ app.post("/api/docusign/start", async (req, res) => {
     const envelopeSummary = await envelopesApi.createEnvelope(cfg.accountId, { envelopeDefinition });
     const envelopeId = envelopeSummary.envelopeId;
 
-    const baseReturn = process.env.DOCUSIGN_RETURN_URL || "https://quantumitech.hu/ugyfel";
-    const returnUrl =
-      baseReturn +
-      `?docusign=return&envelopeId=${encodeURIComponent(envelopeId)}&contractId=${encodeURIComponent(clientUserId)}`;
+    // SAFE return URL (nincs dupla encode)
+    const returnUrl = buildSafeReturnUrl(rawReturnUrl, {
+      envelopeId,
+      contractId: clientUserId,
+      event: "signing_complete",
+    });
 
     const viewRequest = new docusign.RecipientViewRequest();
     viewRequest.returnUrl = returnUrl;
@@ -432,6 +464,7 @@ app.post("/api/docusign/start", async (req, res) => {
       envelopeId,
       contractId: clientUserId,
       signingUrl: viewResult.url,
+      returnUrl,
     });
   } catch (err) {
     const status = err?.response?.status;
@@ -460,85 +493,32 @@ app.post("/api/docusign/start", async (req, res) => {
   }
 });
 
-// Kompatibilis “embedded-sign” endpoint
-app.post("/api/docusign/embedded-sign", async (req, res) => {
+// PDF letöltés: COMBINED document (összefűzött PDF)
+app.get("/api/docusign/download", async (req, res) => {
   try {
-    const customer = req.body?.customer || {};
-    const order = req.body?.order || {};
-
-    const customerName = String(customer.name || "").trim();
-    const customerEmail = String(customer.email || "").trim().toLowerCase();
-
-    if (!customerName) return res.status(400).json({ error: "Missing customer.name" });
-    if (!customerEmail || !customerEmail.includes("@")) {
-      return res.status(400).json({ error: "Missing/invalid customer.email" });
-    }
+    const envelopeId = String(req.query.envelopeId || "").trim();
+    if (!envelopeId) return res.status(400).json({ error: "Missing envelopeId" });
 
     const { apiClient, cfg } = await getDocusignApiClient();
     docusign.Configuration.default.setDefaultApiClient(apiClient);
 
-    const envDef = new docusign.EnvelopeDefinition();
-    envDef.templateId = cfg.templateId;
-    envDef.status = "sent";
-
-    const clientUserId = "customer-1";
-
-    const signer = docusign.TemplateRole.constructFromObject({
-      roleName: "Customer",
-      name: customerName,
-      email: customerEmail,
-      clientUserId,
-      tabs: docusign.Tabs.constructFromObject({
-        textTabs: [
-          { tabLabel: "customer_name", value: customerName },
-          { tabLabel: "company_name", value: String(customer.company || "") },
-          { tabLabel: "customer_email", value: customerEmail },
-          { tabLabel: "customer_phone", value: String(customer.phone || "") },
-          { tabLabel: "billing_address", value: String(customer.billingAddress || "") },
-          { tabLabel: "tax_number", value: String(customer.taxNumber || "") },
-
-          { tabLabel: "plan_name", value: String(order.planName || "") },
-          { tabLabel: "term_months", value: String(order.termMonths || "") },
-          { tabLabel: "devices_total", value: String(order.devicesTotal || "") },
-          { tabLabel: "extra_devices", value: String(order.extraDevices || "") },
-
-          { tabLabel: "monthly_base_price", value: String(order.monthlyBasePrice || "") },
-          { tabLabel: "extra_device_price", value: String(order.extraDevicePrice || "") },
-          { tabLabel: "setup_fee", value: String(order.setupFee || "") },
-          { tabLabel: "monthly_total", value: String(order.monthlyTotal || "") },
-
-          { tabLabel: "sum_period", value: order.termMonths ? `${order.termMonths} hónap` : "" },
-        ],
-      }),
-    });
-
-    envDef.templateRoles = [signer];
-
     const envelopesApi = new docusign.EnvelopesApi(apiClient);
-    const createRes = await envelopesApi.createEnvelope(cfg.accountId, { envelopeDefinition: envDef });
-    const envelopeId = createRes.envelopeId;
 
-    const returnUrl = process.env.DOCUSIGN_RETURN_URL;
-    if (!returnUrl) return res.status(500).json({ error: "Missing DOCUSIGN_RETURN_URL" });
+    // Node SDK-ben getDocument(accountId, envelopeId, documentId)
+    const doc = await envelopesApi.getDocument(cfg.accountId, envelopeId, "combined");
 
-    const viewReq = new docusign.RecipientViewRequest();
-    viewReq.returnUrl = returnUrl;
-    viewReq.authenticationMethod = "none";
-    viewReq.email = customerEmail;
-    viewReq.userName = customerName;
-    viewReq.clientUserId = clientUserId;
-    viewReq.recipientId = "1";
+    // SDK verziótól függően lehet Buffer vagy { body: Buffer/Uint8Array }
+    const bytes = doc?.body ? doc.body : doc;
+    const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
 
-    const viewRes = await envelopesApi.createRecipientView(cfg.accountId, envelopeId, {
-      recipientViewRequest: viewReq,
-    });
-
-    return res.json({ ok: true, envelopeId, url: viewRes.url });
-  } catch (e) {
-    console.error("docusign embedded-sign error:", e?.response?.body || e?.message || e);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="szerzodes-${envelopeId}.pdf"`);
+    return res.status(200).send(buf);
+  } catch (err) {
+    console.error("DOCUSIGN download error:", err?.response?.body || err?.message || err);
     return res.status(500).json({
-      error: "DocuSign error",
-      details: e?.response?.body || e?.message || String(e),
+      error: "DocuSign download failed",
+      details: err?.response?.body || err?.message || String(err),
     });
   }
 });
@@ -569,17 +549,34 @@ app.get("/api/docusign/envelope-status", async (req, res) => {
   }
 });
 
-app.get("/api/docusign/test-sign", (req, res) => {
-  return res.json({ ok: true, next: "implement embedded signing flow here" });
-});
-
 // ======================================================================
 // ============================== STRIPE API =============================
 // ======================================================================
 
+// FONTOS: csak akkor engedjük a Stripe Checkoutot, ha a DocuSign envelope COMPLETED.
 app.post("/api/create-checkout-session", async (req, res) => {
   try {
-    const { email, plan, termMonths, devicesTotal, contractId } = req.body;
+    const { email, plan, termMonths, devicesTotal, contractId, envelopeId } = req.body;
+
+    // Aláírás kötelező
+    if (!envelopeId || typeof envelopeId !== "string") {
+      return res.status(400).json({ error: "Missing/invalid envelopeId (contract must be signed first)" });
+    }
+
+    // ellenőrizzük docusign status
+    {
+      const { apiClient, cfg } = await getDocusignApiClient();
+      docusign.Configuration.default.setDefaultApiClient(apiClient);
+
+      const envelopesApi = new docusign.EnvelopesApi(apiClient);
+      const envelope = await envelopesApi.getEnvelope(cfg.accountId, String(envelopeId));
+      if (String(envelope?.status || "").toLowerCase() !== "completed") {
+        return res.status(403).json({
+          error: "A szerződés még nincs aláírva (DocuSign status != completed).",
+          status: envelope?.status || null,
+        });
+      }
+    }
 
     if (!email || typeof email !== "string") return res.status(400).json({ error: "Missing/invalid email" });
     if (!isValidPlan(plan)) return res.status(400).json({ error: "Invalid plan (basic/premium)" });
@@ -615,6 +612,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
       subscription_data: {
         metadata: {
           contractId: contractId ? String(contractId) : "",
+          envelopeId: String(envelopeId),
           plan: String(plan),
           termMonths: String(term),
           devicesTotal: String(totalDevices),
@@ -624,6 +622,7 @@ app.post("/api/create-checkout-session", async (req, res) => {
       },
       metadata: {
         contractId: contractId ? String(contractId) : "",
+        envelopeId: String(envelopeId),
         plan: String(plan),
         termMonths: String(term),
         devicesTotal: String(totalDevices),
@@ -692,6 +691,7 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 
         await upsertBySubscription(subscriptionId, {
           contractId: session.metadata?.contractId || "",
+          envelopeId: session.metadata?.envelopeId || "",
           customerId: customerId || "",
           email: session.customer_email || "",
           plan: session.metadata?.plan || "",
@@ -794,6 +794,7 @@ app.get("/api/admin/contracts", requireAdmin, async (req, res) => {
         devicesTotal: s.metadata?.devicesTotal ? Number(s.metadata.devicesTotal) : null,
         extraDevices: s.metadata?.extraDevices ? Number(s.metadata.extraDevices) : null,
         commitmentEndsAt: s.metadata?.commitmentEndsAt ? Number(s.metadata.commitmentEndsAt) : null,
+        envelopeId: s.metadata?.envelopeId || "",
       }));
       return res.json({ ok: true, source: "stripe", count: stripeRows.length, items: stripeRows });
     }
@@ -832,6 +833,7 @@ app.get("/api/admin/contract", requireAdmin, async (req, res) => {
         devicesTotal: sub.metadata?.devicesTotal ? Number(sub.metadata?.devicesTotal) : null,
         extraDevices: sub.metadata?.extraDevices ? Number(sub.metadata?.extraDevices) : null,
         commitmentEndsAt: sub.metadata?.commitmentEndsAt ? Number(sub.metadata?.commitmentEndsAt) : null,
+        envelopeId: sub.metadata?.envelopeId || "",
       },
     });
   } catch (e) {
@@ -873,6 +875,7 @@ app.get("/api/session-status", async (req, res) => {
       devicesTotal: metadata.devicesTotal ? Number(metadata.devicesTotal) : null,
       extraDevices: metadata.extraDevices ? Number(metadata.extraDevices) : null,
       commitmentEndsAt: metadata.commitmentEndsAt ? Number(metadata.commitmentEndsAt) : null,
+      envelopeId: metadata.envelopeId || "",
       items,
     });
   } catch (err) {
@@ -931,8 +934,10 @@ app.post("/api/request-cancel", async (req, res) => {
         email: row?.email || "",
         plan: row?.plan || stripeSub?.metadata?.plan || "",
         termMonths: row?.termMonths || (stripeSub?.metadata?.termMonths ? Number(stripeSub.metadata.termMonths) : null),
-        devicesTotal: row?.devicesTotal || (stripeSub?.metadata?.devicesTotal ? Number(stripeSub.metadata.devicesTotal) : null),
-        extraDevices: row?.extraDevices || (stripeSub?.metadata?.extraDevices ? Number(stripeSub.metadata.extraDevices) : null),
+        devicesTotal:
+          row?.devicesTotal || (stripeSub?.metadata?.devicesTotal ? Number(stripeSub.metadata.devicesTotal) : null),
+        extraDevices:
+          row?.extraDevices || (stripeSub?.metadata?.extraDevices ? Number(stripeSub.metadata.extraDevices) : null),
         commitmentEndsAt: commitmentEndsAt || null,
         status: updated.status,
       };
